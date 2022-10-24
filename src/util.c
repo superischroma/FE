@@ -1,3 +1,5 @@
+#include "util.h"
+
 void feInfo(const char* message)
 {
     printf("FE: info: %s\n", message);

@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "util.c"
+#include "util.h"
 
 #define CPU_SIZE 0x10000
 #define PPU_SIZE 0x4000
@@ -12,6 +12,12 @@
 
 #define PRG_SIZE_MAPPER000 0x8000
 #define CHR_SIZE_MAPPER000 0x2000
+
+#define IMPL_SIZE 1
+#define IMM_SIZE 2
+#define IND_SIZE 2
+#define ZP_SIZE 2
+#define ABS_SIZE 3
 
 // Flags
 #define CARRY_FLAG 0
@@ -194,10 +200,27 @@ void updateFlagConditionally(int condition, int bit);
 void updateNegativeFlag(unsigned char c);
 void updateZeroFlag(unsigned char c);
 void updateSignFlags(unsigned char c);
-void pushStack(unsigned char c);
-unsigned char pullStack();
+void m6502pushStack(unsigned char c);
+unsigned char m6502pullStack();
+unsigned char loByte(unsigned short addr);
+unsigned char hiByte(unsigned short addr);
+
+// Instructions
+
+void m6502asl_m(unsigned short mem, int sz);
+void m6502asl_a();
+void m6502lsr_m(unsigned short mem, int sz);
+void m6502lsr_a();
+void m6502ora_m(unsigned short mem, int sz);
+void m6502ora_i(unsigned char i);
+void m6502and_m(unsigned short mem, int sz);
+void m6502and_i(unsigned char i);
+void m6502eor_m(unsigned short mem, int sz);
+void m6502eor_i(unsigned char i);
+void m6502adc_m(unsigned short mem, int sz);
+void m6502adc_i(unsigned char i);
 void branch();
-void jump(unsigned short addr);
+void m6502jmp(unsigned short addr);
 
 int main()
 {
@@ -357,60 +380,43 @@ int executeCurrentInstruction()
             break;
         case ORA_X_IND:
         {
-            regA |= cpu[readAddr(cpu[regX + cpu[++pc]])];
-            updateSignFlags(regA);
-            pc++;
+            m6502ora_m(readAddr(regX + cpu[pc + 1]), IND_SIZE);
             break;
         }
         case ORA_ZP:
         {
-            regA |= cpu[cpu[++pc]];
-            updateSignFlags(regA);
-            pc++;
+            m6502ora_m(cpu[pc + 1], ZP_SIZE);
             break;
         }
         case ASL_ZP:
         {
-            updateFlagConditionally(cpu[cpu[++pc]] & 0b10000000 != 0, CARRY_FLAG);
-            cpu[cpu[pc]] <<= 1;
-            updateSignFlags(cpu[cpu[pc]]);
-            pc++;
+            m6502asl_m(cpu[pc + 1], ZP_SIZE);
             break;
         }
         case PHP:
         {
-            pushStack(flags | (1 << BREAK_FLAG));
+            m6502pushStack(flags | (1 << BREAK_FLAG));
             pc++;
             break;
         }
         case ORA_IMM:
         {
-            regA |= cpu[++pc];
-            updateSignFlags(regA);
-            pc++;
+            m6502ora_i(cpu[pc + 1]);
             break;
         }
         case ASL_A:
         {
-            updateFlagConditionally(regA & 0b10000000 != 0, CARRY_FLAG);
-            regA <<= 1;
-            updateSignFlags(regA);
-            pc++;
+            m6502asl_a();
             break;
         }
         case ORA_ABS:
         {
-            regA |= cpu[readAddr(cpu[++pc])];
-            updateSignFlags(regA);
-            pc += 2;
+            m6502ora_m(readAddr(pc + 1), ABS_SIZE);
             break;
         }
         case ASL_ABS:
         {
-            updateFlagConditionally(cpu[readAddr(cpu[++pc])] & 0b10000000 != 0, CARRY_FLAG);
-            cpu[readAddr(cpu[pc])] <<= 1;
-            updateSignFlags(cpu[readAddr(cpu[pc])]);
-            pc += 2;
+            m6502asl_m(readAddr(pc + 1), ABS_SIZE);
             break;
         }
         case BPL:
@@ -422,8 +428,223 @@ int executeCurrentInstruction()
         }
         case ORA_Y_IND:
         {
-            regA |= cpu[readAddr(cpu[cpu[++pc]]) + regY];
-            updateSignFlags(regA);
+            m6502ora_m(readAddr(cpu[pc + 1]) + regY, IND_SIZE);
+            break;
+        }
+        case ORA_ZP_X:
+        {
+            m6502ora_m(regX + cpu[pc + 1], ZP_SIZE);
+            break;
+        }
+        case ASL_ZP_X:
+        {
+            m6502asl_m(regX + cpu[pc + 1], ZP_SIZE);
+            break;
+        }
+        case CLC:
+        {
+            clearFlag(CARRY_FLAG);
+            pc++;
+            break;
+        }
+        case ORA_ABS_Y:
+        case ORA_ABS_X:
+        {
+            m6502ora_m(readAddr(pc + 1) + (opcode == ORA_ABS_Y ? regY : regX), ABS_SIZE);
+            break;
+        }
+        case ASL_ABS_X:
+        {
+            m6502asl_m(readAddr(pc + 1) + regX, ABS_SIZE);
+            break;
+        }
+        case JSR:
+        {
+            m6502pushStack(hiByte(pc + 2));
+            m6502pushStack(loByte(pc + 2));
+            m6502jmp(readAddr(pc + 1));
+            break;
+        }
+        case AND_X_IND:
+        {
+            m6502and_m(readAddr(regX + cpu[pc + 1]), IND_SIZE);
+            break;
+        }
+        case BIT_ZP:
+        {
+            m6502bit(cpu[pc + 1], ZP_SIZE);
+            break;
+        }
+        case AND_ZP:
+        {
+            m6502and_m(cpu[pc + 1], ZP_SIZE);
+            break;
+        }
+        case ROL_ZP:
+        {
+            m6502rol_m(cpu[pc + 1], ZP_SIZE);
+            break;
+        }
+        case PLP:
+        {
+            flags = m6502pullStack();
+            break;
+        }
+        case AND_IMM:
+        {
+            m6502and_i(pc + 1);
+            break;
+        }
+        case ROL_A:
+        {
+            m6502rol_a();
+            break;
+        }
+        case BIT_ABS:
+        {
+            m6502bit(readAddr(pc + 1), ABS_SIZE);
+            break;
+        }
+        case AND_ABS:
+        {
+            m6502and_m(readAddr(pc + 1), ABS_SIZE);
+            break;
+        }
+        case ROL_ABS:
+        {
+            m6502rol_m(readAddr(pc + 1), ABS_SIZE);
+            break;
+        }
+        case BMI:
+        {
+            if (!isFlagSet(NEGATIVE_FLAG))
+                break;
+            branch();
+            break;
+        }
+        case AND_Y_IND:
+        {
+            m6502and_m(readAddr(cpu[pc + 1]) + regY, IND_SIZE);
+            break;
+        }
+        case AND_ZP_X:
+        {
+            m6502and_m(regX + cpu[pc + 1], ZP_SIZE);
+            break;
+        }
+        case ROL_ZP_X:
+        {
+            m6502rol_m(regX + cpu[pc + 1], ZP_SIZE);
+            break;
+        }
+        case SEC:
+        {
+            setFlag(CARRY_FLAG);
+            break;
+        }
+        case AND_ABS_Y:
+        case AND_ABS_X:
+        {
+            m6502and_m(readAddr(pc + 1) + (opcode == AND_ABS_Y ? regY : regX), ABS_SIZE);
+            break;
+        }
+        case ROL_ABS_X:
+        {
+            m6502rol_m(readAddr(pc + 1) + regX, ABS_SIZE);
+            break;
+        }
+        case RTI:
+        {
+            flags = m6502pullStack();
+            pc = m6502pullStack();
+            break;
+        }
+        case EOR_X_IND:
+        {
+            m6502eor_m(readAddr(regX + cpu[pc + 1]), IND_SIZE);
+            break;
+        }
+        case EOR_ZP:
+        {
+            m6502eor_m(cpu[pc + 1], ZP_SIZE);
+            break;
+        }
+        case LSR_ZP:
+        {
+            m6502lsr_m(cpu[pc + 1], ZP_SIZE);
+            break;
+        }
+        case PHA:
+        {
+            m6502pushStack(regA);
+            break;
+        }
+        case EOR_IMM:
+        {
+            m6502eor_i(pc + 1);
+            break;
+        }
+        case LSR_A:
+        {
+            m6502lsr_a();
+            break;
+        }
+        case JMP_ABS:
+        {
+            m6502jmp(readAddr(pc + 1));
+            break;
+        }
+        case EOR_ABS:
+        {
+            m6502eor_m(readAddr(pc + 1), ABS_SIZE);
+            break;
+        }
+        case LSR_ABS:
+        {
+            m6502lsr_m(readAddr(pc + 1), ABS_SIZE);
+            break;
+        }
+        case BVC:
+        {
+            if (isFlagSet(OVERFLOW_FLAG))
+                break;
+            branch();
+            break;
+        }
+        case EOR_Y_IND:
+        {
+            m6502eor_m(readAddr(cpu[pc + 1]) + regY, IND_SIZE);
+            break;
+        }
+        case EOR_ZP_X:
+        {
+            m6502eor_m(regX + cpu[pc + 1], ZP_SIZE);
+            break;
+        }
+        case LSR_ZP_X:
+        {
+            m6502lsr_m(regX + cpu[pc + 1], ZP_SIZE);
+            break;
+        }
+        case CLI:
+        {
+            clearFlag(INTERRUPT_FLAG);
+            break;
+        }
+        case EOR_ABS_Y:
+        case EOR_ABS_X:
+        {
+            m6502eor_m(readAddr(pc + 1) + (opcode == EOR_ABS_Y ? regY : regX), ABS_SIZE);
+            break;
+        }
+        case LSR_ABS_X:
+        {
+            m6502lsr_m(readAddr(pc + 1) + regX, ABS_SIZE);
+            break;
+        }
+        case RTS:
+        {
+            pc = m6502pullStack();
             pc++;
             break;
         }
@@ -431,7 +652,7 @@ int executeCurrentInstruction()
     return 0;
 }
 
-// Reads a small endian 16-bit address at addr
+// Reads a little endian 16-bit address at addr
 unsigned short readAddr(unsigned short addr)
 {
     return (((unsigned short) cpu[addr + 1]) << 8) | ((unsigned short) cpu[addr]);
@@ -490,12 +711,12 @@ void updateSignFlags(unsigned char c)
     updateZeroFlag(c);
 }
 
-void pushStack(unsigned char c)
+void m6502pushStack(unsigned char c)
 {
     cpu[((unsigned short) 0x0100) + ((unsigned short) regS--)] = c;
 }
 
-unsigned char pullStack()
+unsigned char m6502pullStack()
 {
     return cpu[((unsigned short) 0x0100) + ((unsigned short) ++regS)];
 }
@@ -507,7 +728,161 @@ void branch()
     pc += cpu[pc - 1];
 }
 
-void jump(unsigned short addr)
+void m6502jmp(unsigned short addr)
 {
     pc = addr;
+}
+
+void m6502asl_m(unsigned short mem, int sz)
+{
+    updateFlagConditionally(cpu[mem] & 0b10000000 != 0, CARRY_FLAG);
+    cpu[mem] <<= 1;
+    updateSignFlags(cpu[mem]);
+    pc += sz;
+}
+
+void m6502asl_a()
+{
+    updateFlagConditionally(regA & 0b10000000 != 0, CARRY_FLAG);
+    regA <<= 1;
+    updateSignFlags(regA);
+    pc++;
+}
+
+void m6502lsr_m(unsigned short mem, int sz)
+{
+    updateFlagConditionally(cpu[mem] & 0b00000001 != 0, CARRY_FLAG);
+    cpu[mem] >>= 1;
+    updateSignFlags(cpu[mem]);
+    pc += sz;
+}
+
+void m6502lsr_a()
+{
+    updateFlagConditionally(regA & 0b00000001 != 0, CARRY_FLAG);
+    regA >>= 1;
+    updateSignFlags(regA);
+    pc++;
+}
+
+void m6502rol_m(unsigned short mem, int sz)
+{
+    int c = isFlagSet(CARRY_FLAG);
+    updateFlagConditionally(cpu[mem] & 0b10000000 != 0, CARRY_FLAG);
+    cpu[mem] <<= 1;
+    cpu[mem] = (cpu[mem] & ~1) | c;
+    updateSignFlags(cpu[mem]);
+    pc += sz;
+}
+
+void m6502rol_a()
+{
+    int c = isFlagSet(CARRY_FLAG);
+    updateFlagConditionally(regA & 0b10000000 != 0, CARRY_FLAG);
+    regA <<= 1;
+    regA = (regA & ~1) | c;
+    updateSignFlags(regA);
+    pc++;
+}
+
+void m6502ora_m(unsigned short mem, int sz)
+{
+    regA |= cpu[mem];
+    updateSignFlags(regA);
+    pc += sz;
+}
+
+void m6502ora_i(unsigned char i)
+{
+    regA |= i;
+    updateSignFlags(regA);
+    pc += 2;
+}
+
+void m6502and_m(unsigned short mem, int sz)
+{
+    regA &= cpu[mem];
+    updateSignFlags(regA);
+    pc += sz;
+}
+
+void m6502and_i(unsigned char i)
+{
+    regA &= i;
+    updateSignFlags(regA);
+    pc += 2;
+}
+
+void m6502eor_m(unsigned short mem, int sz)
+{
+    regA ^= cpu[mem];
+    updateSignFlags(regA);
+    pc += sz;
+}
+
+void m6502eor_i(unsigned char i)
+{
+    regA ^= i;
+    updateSignFlags(regA);
+    pc += 2;
+}
+
+// segments marked with an asterisk for adc and sbc instructions come from https://stackoverflow.com/questions/29193303/6502-emulation-proper-way-to-implement-adc-and-sbc
+
+void m6502adc_m(unsigned short mem, int sz)
+{
+    unsigned short sum = (unsigned short) regA + (unsigned short) cpu[mem] + isFlagSet(CARRY_FLAG);
+    if (sum > 0xFF)
+        setFlag(CARRY_FLAG);
+    if (~(regA ^ cpu[mem]) & (regA ^ sum) & 0x80) // *
+        setFlag(OVERFLOW_FLAG);
+    regA += cpu[mem] + ((unsigned char) isFlagSet(CARRY_FLAG));
+    updateSignFlags(regA);
+    pc += sz;
+}
+
+void m6502adc_i(unsigned char i)
+{
+    unsigned short sum = (unsigned short) regA + (unsigned short) i + isFlagSet(CARRY_FLAG);
+    if (sum > 0xFF)
+        setFlag(CARRY_FLAG);
+    if (~(regA ^ i) & (regA ^ sum) & 0x80) // *
+        setFlag(OVERFLOW_FLAG);
+    regA += i + ((unsigned char) isFlagSet(CARRY_FLAG));
+    updateSignFlags(regA);
+    pc += 2;
+}
+
+void m6502sbc_m(unsigned short mem, int sz)
+{
+    unsigned short sum = (unsigned short) regA + (unsigned short) ~(cpu[mem]) + isFlagSet(CARRY_FLAG);
+    if (sum > 0xFF)
+        setFlag(CARRY_FLAG);
+    if (~(regA ^ ~(cpu[mem])) & (regA ^ sum) & 0x80) // *
+        setFlag(OVERFLOW_FLAG);
+    regA += ~(cpu[mem]) + ((unsigned char) isFlagSet(CARRY_FLAG));
+    updateSignFlags(regA);
+    pc += sz;
+}
+
+void m6502sbc_i(unsigned char i)
+{
+    return m6502adc_i(~i);
+}
+
+void m6502bit(unsigned short mem, int sz)
+{
+    flags = (flags & 0b00111111) | (cpu[mem] & 0b11000000);
+    updateZeroFlag(mem & regA);
+    pc += sz;
+}
+
+unsigned char loByte(unsigned short addr)
+{
+    return (unsigned char) ((addr << 8) >> 8);
+}
+
+unsigned char hiByte(unsigned short addr)
+{
+    return (unsigned char) (addr >> 8);
 }
