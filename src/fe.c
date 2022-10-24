@@ -196,7 +196,7 @@ void updateZeroFlag(unsigned char c);
 void updateSignFlags(unsigned char c);
 void pushStack(unsigned char c);
 unsigned char pullStack();
-void branch(unsigned char offset);
+void branch();
 void jump(unsigned short addr);
 
 int main()
@@ -417,8 +417,7 @@ int executeCurrentInstruction()
         {
             if (isFlagSet(NEGATIVE_FLAG))
                 break;
-            pc += 2;
-            pc += cpu[pc - 1];
+            branch();
             break;
         }
         case ORA_Y_IND:
@@ -502,7 +501,7 @@ unsigned char pullStack()
 }
 
 // ip should be on the branch instruction
-void branch(unsigned char offset)
+void branch()
 {
     pc += 2;
     pc += cpu[pc - 1];
