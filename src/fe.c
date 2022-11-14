@@ -3,15 +3,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "util.h"
-
 #define CPU_SIZE 0x10000
 #define PPU_SIZE 0x4000
 
 #define CPU_PRG_OFFSET 0x8000
-
-#define PRG_SIZE_MAPPER000 0x8000
-#define CHR_SIZE_MAPPER000 0x2000
 
 #define IMPL_SIZE 1
 #define IMM_SIZE 2
@@ -195,11 +190,15 @@
 const char ines_constant[] = "NES\x1A";
 
 unsigned char* cpu, * ppu;
-unsigned short pc = 0x8000;
+unsigned short pc = 0x0000;
 unsigned char regA, regX, regY, regS;
 unsigned char flags;
 
 int safeExit();
+void feInfo(const char* message);
+void feErr(const char* message);
+void feROMErr(const char* message);
+void printBin(unsigned char c);
 int loadROM(FILE* file);
 int executeCurrentInstruction();
 unsigned short readAddr(unsigned short addr);
@@ -215,6 +214,7 @@ void m6502pushStack(unsigned char c);
 unsigned char m6502pullStack();
 unsigned char loByte(unsigned short addr);
 unsigned char hiByte(unsigned short addr);
+unsigned short combineBytes(unsigned short lo, unsigned short hi);
 void m6502branch();
 void m6502store(unsigned char* r, unsigned short mem, int sz);
 void m6502load_m(unsigned char* r, unsigned short mem, int sz);
@@ -266,7 +266,7 @@ int main()
     cpu[PPUADDR] = 0;
     cpu[PPUDATA] = 0;
 
-    FILE* file = fopen("./smb.nes", "r");
+    FILE* file = fopen("./dk.nes", "r");
     if (file == NULL)
     {
         feInfo("Could not find testing ROM");
@@ -296,13 +296,13 @@ int main()
 
     while (!glfwWindowShouldClose(window))
     {
-        glClear(GL_COLOR_BUFFER_BIT);
-        glfwSwapBuffers(window);
-        glfwPollEvents();
+        //glClear(GL_COLOR_BUFFER_BIT);
+        //glfwSwapBuffers(window);
+        //glfwPollEvents();
 
         if (executeCurrentInstruction() == -1)
             return safeExit(-1);
-        printEmulatorOverview();
+        //printEmulatorOverview();
     }
 
     glfwTerminate();
@@ -340,7 +340,7 @@ int loadROM(FILE* file)
         feROMErr("End of file");
         return -1;
     }
-    if (prgSize != 2) // For now, only 32kb PRG
+    if (prgSize != 1) // For now, only 16kb PRG
     {
         feROMErr("Unsupported PRG ROM size");
         return -1;
@@ -382,7 +382,7 @@ int loadROM(FILE* file)
         }
     }
     // Copy PRG data into emulated CPU memory
-    for (int i = 0; i < PRG_SIZE_MAPPER000; i++)
+    for (int i = 0; i < prgSize * 0x4000; i++)
     {
         int c = fgetc(file);
         if (c == EOF)
@@ -391,9 +391,14 @@ int loadROM(FILE* file)
             return -1;
         }
         cpu[i + CPU_PRG_OFFSET] = (unsigned char) c;
+        if (prgSize == 1) // mirror it for 16kb PRG
+            cpu[i + 0x4000 + CPU_PRG_OFFSET] = (unsigned char) c;
     }
+    // Load Reset address from vector
+    pc = combineBytes(cpu[CPU_PRG_OFFSET - 0x10 + 0xC + (0x4000 * prgSize)], cpu[CPU_PRG_OFFSET - 0x10 + 0xD + (0x4000 * prgSize)]);
+    printf("Reset from $%x\n", pc);
     // Copy CHR data into emulated PPU memory
-    for (int i = 0; i < CHR_SIZE_MAPPER000; i++)
+    for (int i = 0; i < chrSize * 0x2000; i++)
     {
         int c = fgetc(file);
         if (c == EOF)
@@ -415,7 +420,10 @@ int executeCurrentInstruction()
     switch (opcode)
     {
         case BRK: // What the hell does this do????
+        {
+            pc++;
             break;
+        }
         case ORA_X_IND:
         {
             m6502ora_m(readAddr(regX + cpu[pc + 1]), IND_SIZE);
@@ -695,7 +703,9 @@ int executeCurrentInstruction()
         }
         case RTS:
         {
-            pc = m6502pullStack();
+            unsigned char lo = m6502pullStack();
+            unsigned char hi = m6502pullStack();
+            pc = combineBytes(lo, hi);
             pc++;
             break;
         }
@@ -717,6 +727,7 @@ int executeCurrentInstruction()
         case PLA:
         {
             regA = m6502pullStack();
+            updateSignFlags(regA);
             pc++;
             break;
         }
@@ -810,12 +821,14 @@ int executeCurrentInstruction()
         case DEY:
         {
             regY--;
+            updateSignFlags(regY);
             pc++;
             break;
         }
         case TXA:
         {
             regA = regX;
+            updateSignFlags(regA);
             pc++;
             break;
         }
@@ -867,6 +880,7 @@ int executeCurrentInstruction()
         case TYA:
         {
             regA = regY;
+            updateSignFlags(regA);
             pc++;
             break;
         }
@@ -879,6 +893,7 @@ int executeCurrentInstruction()
         case TXS:
         {
             regS = regX;
+            updateSignFlags(regS);
             pc++;
             break;
         }
@@ -915,6 +930,7 @@ int executeCurrentInstruction()
         case TAY:
         {
             regY = regA;
+            updateSignFlags(regY);
             pc++;
             break;
         }
@@ -926,6 +942,7 @@ int executeCurrentInstruction()
         case TAX:
         {
             regX = regA;
+            updateSignFlags(regX);
             pc++;
             break;
         }
@@ -989,6 +1006,7 @@ int executeCurrentInstruction()
         case TSX:
         {
             regX = regS;
+            updateSignFlags(regX);
             pc++;
             break;
         }
@@ -1030,6 +1048,7 @@ int executeCurrentInstruction()
         case INY:
         {
             regY++;
+            updateSignFlags(regY);
             pc++;
             break;
         }
@@ -1041,6 +1060,7 @@ int executeCurrentInstruction()
         case DEX:
         {
             regX--;
+            updateSignFlags(regX);
             pc++;
             break;
         }
@@ -1133,6 +1153,7 @@ int executeCurrentInstruction()
         case INX:
         {
             regX++;
+            updateSignFlags(regX);
             pc++;
             break;
         }
@@ -1142,7 +1163,10 @@ int executeCurrentInstruction()
             break;
         }
         case NOP:
+        {
+            pc++;
             break;
+        }
         case CPX_ABS:
         {
             m6502cmp_m(&regX, readAddr(pc + 1), ABS_SIZE);
@@ -1497,12 +1521,14 @@ void m6502cmp_i(unsigned char* r, unsigned char i)
 void m6502inc(unsigned short mem, int sz)
 {
     cpu[mem]++;
+    updateSignFlags(cpu[mem]);
     pc += sz;
 }
 
 void m6502dec(unsigned short mem, int sz)
 {
     cpu[mem]--;
+    updateSignFlags(cpu[mem]);
     pc += sz;
 }
 
@@ -1516,6 +1542,11 @@ unsigned char hiByte(unsigned short addr)
     return (unsigned char) (addr >> 8);
 }
 
+unsigned short combineBytes(unsigned short lo, unsigned short hi)
+{
+    return (((unsigned short) hi) << 8) | lo;
+}
+
 void printEmulatorOverview()
 {
     printf("-- EMULATOR STATE --\n");
@@ -1523,4 +1554,30 @@ void printEmulatorOverview()
     printf("pc: $%x     flags: %%", pc);
     printBin(flags);
     printf("\n");
+}
+
+void feInfo(const char* message)
+{
+    printf("FE: info: %s\n", message);
+}
+
+void feErr(const char* message)
+{
+    printf("FE: error: %s\n", message);
+}
+
+void feROMErr(const char* message)
+{
+    printf("FE: error: Could not load ROM: %s\n", message);
+}
+
+void printBin(unsigned char c)
+{
+    char number[9];
+    number[8] = '\0';
+    for (int i = 0; i < 8; i++)
+    {
+        number[7 - i] = (((c >> i) & 0b00000001) != 0) ? '1' : '0';
+    }
+    printf(number);
 }
