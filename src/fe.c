@@ -1,4 +1,5 @@
 #include <GLFW/glfw3.h>
+#include <sys/time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +8,9 @@
 #define PPU_SIZE 0x4000
 
 #define CPU_PRG_OFFSET 0x8000
+
+#define CPU_CYCLES_PER_FRAME 29781
+#define PPU_CYCLES_PER_FRAME 89342
 
 #define IMPL_SIZE 1
 #define IMM_SIZE 2
@@ -187,6 +191,25 @@
 #define SBC_ABS_X 0xFD
 #define INC_ABS_X 0xFE
 
+const unsigned char cycle_count_table[] = {
+    7, 6, 0, 8, 3, 3, 5, 5, 3, 2, 2, 2, 4, 4, 6, 6,
+    2, 5, 0, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7,
+    6, 6, 0, 8, 3, 3, 5, 5, 4, 2, 2, 2, 4, 4, 6, 6,
+    2, 5, 0, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7,
+    6, 6, 0, 8, 3, 3, 5, 5, 3, 2, 2, 2, 3, 4, 6, 6,
+    2, 5, 0, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7, 
+    6, 6, 0, 8, 3, 3, 5, 0, 4, 2, 2, 0, 5, 4, 6, 0,
+    2, 5, 0, 8, 4, 4, 6, 0, 2, 4, 2, 0, 0, 4, 7, 0,
+    2, 6, 0, 6, 3, 3, 3, 0, 2, 2, 2, 0, 4, 4, 4, 0,
+    2, 5, 0, 6, 4, 4, 4, 0, 2, 5, 2, 0, 0, 4, 0, 0,
+    2, 6, 0, 6, 3, 3, 3, 0, 2, 2, 2, 0, 4, 5, 4, 0,
+    2, 5, 0, 5, 4, 4, 4, 0, 2, 4, 2, 0, 4, 4, 4, 0,
+    2, 6, 0, 8, 3, 3, 5, 0, 2, 2, 2, 0, 4, 4, 6, 0,
+    2, 5, 0, 8, 4, 4, 6, 0, 2, 4, 2, 0, 0, 4, 7, 0,
+    2, 6, 0, 8, 3, 3, 5, 0, 2, 2, 2, 0, 4, 4, 6, 0,
+    2, 5, 0, 8, 4, 4, 6, 0, 2, 4, 2, 0, 0, 4, 7, 0
+};
+
 const char ines_constant[] = "NES\x1A";
 
 unsigned char* cpu, * ppu;
@@ -194,11 +217,15 @@ unsigned short pc = 0x0000;
 unsigned char regA, regX, regY, regS;
 unsigned char flags;
 
+unsigned long long instructionCount = 0;
+unsigned short cpuCyclesEmulated = 0;
+
 int safeExit();
 void feInfo(const char* message);
 void feErr(const char* message);
 void feROMErr(const char* message);
 void printBin(unsigned char c);
+uint64_t timestamp();
 int loadROM(FILE* file);
 int executeCurrentInstruction();
 unsigned short readAddr(unsigned short addr);
@@ -296,12 +323,29 @@ int main()
 
     while (!glfwWindowShouldClose(window))
     {
+        uint64_t time = timestamp();
         //glClear(GL_COLOR_BUFFER_BIT);
         //glfwSwapBuffers(window);
         //glfwPollEvents();
-
-        if (executeCurrentInstruction() == -1)
-            return safeExit(-1);
+        while (1)
+        {
+            if (timestamp() - time >= CPU_CYCLES_PER_FRAME) // length of a frame has passed
+            {
+                if (cpuCyclesEmulated < 29781)
+                    printf("Was not able to emulate all CPU cycles for this frame\n");
+                break;
+            }
+            if (cpuCyclesEmulated >= CPU_CYCLES_PER_FRAME) // skip if we have already emulated enough CPU cycles for this frame
+                continue;
+            if (executeCurrentInstruction() == -1)
+                return safeExit(-1);
+            if (cpuCyclesEmulated >= CPU_CYCLES_PER_FRAME)
+            {
+                uint64_t took = timestamp() - time;
+                printf("Completed CPU cycle emulation for this frame in %li us! (%f%% of time used)\n", took, took / 166.66);
+            }
+        }
+        cpuCyclesEmulated = 0;
         //printEmulatorOverview();
     }
 
@@ -416,7 +460,8 @@ int loadROM(FILE* file)
 int executeCurrentInstruction()
 {
     unsigned char opcode = cpu[pc];
-    printf("Executing instruction with opcode $%x (pc: $%x)\n", opcode, pc);
+    cpuCyclesEmulated += cycle_count_table[opcode];
+    //printf("Executing instruction with opcode $%x (pc: $%x)\n", opcode, pc);
     switch (opcode)
     {
         case BRK: // What the hell does this do????
@@ -1234,6 +1279,7 @@ int executeCurrentInstruction()
             return -1;
         }
     }
+    instructionCount++;
     return 0;
 }
 
@@ -1580,4 +1626,12 @@ void printBin(unsigned char c)
         number[7 - i] = (((c >> i) & 0b00000001) != 0) ? '1' : '0';
     }
     printf(number);
+}
+
+// sum stack overflow code
+uint64_t timestamp()
+{
+    struct timeval tv;
+    gettimeofday(&tv,NULL);
+    return tv.tv_sec*(uint64_t)1000000+tv.tv_usec;
 }
