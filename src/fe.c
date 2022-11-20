@@ -12,6 +12,20 @@
 #define CPU_CYCLES_PER_FRAME 29781
 #define PPU_CYCLES_PER_FRAME 89342
 
+#define CPU_CYCLES_PER_SCANLINE 114
+#define PPU_CYCLES_PER_SCANLINE 340
+
+#define FRAME_LENGTH_US 16666
+#define SCANLINE_LENGTH_US 64
+
+#define SCANLINES 262
+#define PRERENDER_SCANLINE -1
+#define POSTRENDER_SCANLINE 240
+#define FIRST_VBLANK_SCANLINE 241
+
+#define SCREEN_WIDTH 256
+#define SCREEN_HEIGHT 240
+
 #define IMPL_SIZE 1
 #define IMM_SIZE 2
 #define IND_SIZE 2
@@ -37,6 +51,18 @@
 #define PPUADDR 0x2006
 #define PPUDATA 0x2007
 #define OAMDMA 0x4014
+
+// Vectors
+#define NMI_VECTOR 0xFFFA
+#define RESET_VECTOR 0xFFFC
+#define IRQ_VECTOR 0xFFFE
+
+// PPUCTRL bits
+#define NMI_BIT 7
+#define VRAM_INC_BIT 2
+
+// PPUSTATUS bits
+#define VBLANK_BIT 7
 
 // Instruction Opcodes
 #define BRK 0x00
@@ -191,6 +217,30 @@
 #define SBC_ABS_X 0xFD
 #define INC_ABS_X 0xFE
 
+typedef struct {
+    unsigned int coarseXScroll : 5;
+    unsigned int coarseYScroll : 5;
+    unsigned int nametableSelect : 2;
+    unsigned int fineYScroll : 3;
+    unsigned int exactAddr : 14; // this is a full memory address that's used by PPUADDR/PPUDATA; these bits should be distributed to the other fields as well
+} vram_addr_t;
+
+typedef struct {
+    vram_addr_t currentVRamAddr;
+    vram_addr_t tempVRamAddr;
+    unsigned int fineXScroll : 3;
+    unsigned int writeToggle : 1;
+    unsigned short patternShiftRHi;
+    unsigned short patternShiftRLo;
+    unsigned char paletteShiftRHi;
+    unsigned char paletteShiftRLo;
+    unsigned char pOAM[256];
+    unsigned char sOAM[32];
+    unsigned char spriteShiftRegs[8][2];
+    unsigned char spriteLatches[8];
+    unsigned char spriteCounters[8];
+} ppu_t;
+
 const unsigned char cycle_count_table[] = {
     7, 6, 0, 8, 3, 3, 5, 5, 3, 2, 2, 2, 4, 4, 6, 6,
     2, 5, 0, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7,
@@ -210,12 +260,22 @@ const unsigned char cycle_count_table[] = {
     2, 5, 0, 8, 4, 4, 6, 0, 2, 4, 2, 0, 0, 4, 7, 0
 };
 
+const unsigned int palette_to_rgb_table[] = {
+    0x545454, 0x001E74, 0x081090, 0x300088, 0x440064, 0x5C0030, 0x540400, 0x3C1800, 0x202A00, 0x083A00, 0x004000, 0x003C00, 0x00323C, 0x000000, 0x000000, 0x000000,
+    0x989698, 0x084CC4, 0x3032EC, 0x5C1EE4, 0x8814B0, 0xA01464, 0x982220, 0x783C00, 0x545A00, 0x287200, 0x087C00, 0x007628, 0x006678, 0x000000, 0x000000, 0x000000,
+    0xECEEEC, 0x4C9AEC, 0x787CEC, 0xB062EC, 0xE454EC, 0xEC58B4, 0xEC6A64, 0xD48820, 0xA0AA00, 0x74C400, 0x4CD020, 0x38CC6C, 0x38B4CC, 0x3C3C3C, 0x000000, 0x000000,
+    0xECEEEC, 0xA8CCEC, 0xBCBCEC, 0xD4B2EC, 0xECAEEC, 0xECAED4, 0xECB4B0, 0xE4C490, 0xCCD278, 0xB4DE78, 0xA8E290, 0x98E2B4, 0xA0D6E4, 0xA0A2A0, 0x000000, 0x000000
+};
+
 const char ines_constant[] = "NES\x1A";
 
-unsigned char* cpu, * ppu;
+unsigned char* cpuMem, * ppuMem;
+ppu_t ppu_obj = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0, 0, 0, 0, 0, 0 };
 unsigned short pc = 0x0000;
 unsigned char regA, regX, regY, regS;
 unsigned char flags;
+
+unsigned char* screenBuffer;
 
 unsigned long long instructionCount = 0;
 unsigned short cpuCyclesEmulated = 0;
@@ -233,6 +293,7 @@ void setFlag(int bit);
 void clearFlag(int bit);
 int flipFlag(int bit);
 int isFlagSet(int bit);
+int isBitSet(unsigned char field, int bit);
 void updateFlagConditionally(int condition, int bit);
 void updateNegativeFlag(unsigned char c);
 void updateZeroFlag(unsigned char c);
@@ -243,12 +304,16 @@ unsigned char loByte(unsigned short addr);
 unsigned char hiByte(unsigned short addr);
 unsigned short combineBytes(unsigned short lo, unsigned short hi);
 void m6502branch();
+void m6502interrupt(unsigned short addr);
 void m6502store(unsigned char* r, unsigned short mem, int sz);
 void m6502load_m(unsigned char* r, unsigned short mem, int sz);
 void m6502load_i(unsigned char* r, unsigned char i);
 void m6502cmp_m(unsigned char* r, unsigned short mem, int sz);
 void m6502cmp_i(unsigned char* r, unsigned char i);
 void printEmulatorOverview();
+void loadTwoTiles();
+unsigned short inc5BitInt(unsigned short addr, int offset);
+void updatePixel(int x, int y, int rgb);
 
 // Instructions
 
@@ -279,19 +344,20 @@ int main()
 {
     regA = regX = regY = regS = flags = (unsigned char) 0;
     // Create CPU and PPU memory
-    cpu = malloc(CPU_SIZE);
+    cpuMem = malloc(CPU_SIZE);
     feInfo("Created emulated CPU memory");
-    ppu = malloc(PPU_SIZE);
+    ppuMem = malloc(PPU_SIZE);
     feInfo("Created emulated PPU memory");
+    screenBuffer = malloc(SCREEN_WIDTH * SCREEN_HEIGHT * 3);
 
     // Initialize PPU registers
-    cpu[PPUCTRL] = 0;
-    cpu[PPUMASK] = 0;
-    cpu[PPUSTATUS] = 0b10100000;
-    cpu[OAMADDR] = 0;
-    cpu[PPUSCROLL] = 0;
-    cpu[PPUADDR] = 0;
-    cpu[PPUDATA] = 0;
+    cpuMem[PPUCTRL] = 0;
+    cpuMem[PPUMASK] = 0;
+    cpuMem[PPUSTATUS] = 0b10100000;
+    cpuMem[OAMADDR] = 0;
+    cpuMem[PPUSCROLL] = 0;
+    cpuMem[PPUADDR] = 0;
+    cpuMem[PPUDATA] = 0;
 
     FILE* file = fopen("./dk.nes", "r");
     if (file == NULL)
@@ -312,7 +378,7 @@ int main()
         return safeExit(-1);
     }
 
-    window = glfwCreateWindow(256, 240, "FE", NULL, NULL);
+    window = glfwCreateWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "FE", NULL, NULL);
     if (!window)
     {
         glfwTerminate();
@@ -323,30 +389,54 @@ int main()
 
     while (!glfwWindowShouldClose(window))
     {
-        uint64_t time = timestamp();
-        //glClear(GL_COLOR_BUFFER_BIT);
-        //glfwSwapBuffers(window);
-        //glfwPollEvents();
-        while (1)
+        for (int s = -1; s < SCANLINES - 1; s++)
         {
-            if (timestamp() - time >= CPU_CYCLES_PER_FRAME) // length of a frame has passed
+            uint64_t time = timestamp();
+            // CPU
+            while (cpuCyclesEmulated < CPU_CYCLES_PER_SCANLINE) // emulate CPU cycles for this scanline
+                executeCurrentInstruction();
+            cpuCyclesEmulated = 0;
+            // PPU
+            if (s >= FIRST_VBLANK_SCANLINE)
+                goto completion;
+            if (s == POSTRENDER_SCANLINE)
             {
-                if (cpuCyclesEmulated < 29781)
-                    printf("Was not able to emulate all CPU cycles for this frame\n");
-                break;
+                cpuMem[PPUSTATUS] |= VBLANK_BIT; // enter VBlank
+                if (isBitSet(cpuMem[PPUCTRL], NMI_BIT)) // generate NMI?
+                    m6502interrupt(combineBytes(cpuMem[NMI_VECTOR], cpuMem[NMI_VECTOR + 1]));
+                goto completion;
             }
-            if (cpuCyclesEmulated >= CPU_CYCLES_PER_FRAME) // skip if we have already emulated enough CPU cycles for this frame
-                continue;
-            if (executeCurrentInstruction() == -1)
-                return safeExit(-1);
-            if (cpuCyclesEmulated >= CPU_CYCLES_PER_FRAME)
+            if (s == PRERENDER_SCANLINE)
             {
-                uint64_t took = timestamp() - time;
-                printf("Completed CPU cycle emulation for this frame in %li us! (%f%% of time used)\n", took, took / 166.66);
+                loadTwoTiles(); // load the first two tiles
+                cpuMem[PPUSTATUS] &= ~VBLANK_BIT; // exit VBlank
+                goto completion;
             }
+            for (int t = 0; t < 0x20; t++)
+            {
+                // load pixels for the current shift registers
+                int paletteIndex = ((ppu_obj.paletteShiftRHi & 1) << 1) | (ppu_obj.paletteShiftRLo & 1);
+                int paletteColorIndex = ((ppu_obj.patternShiftRHi & (1 << 7)) >> 6) | ((ppu_obj.patternShiftRLo & (1 << 7)) >> 7);
+                updatePixel(ppu_obj.currentVRamAddr.coarseXScroll, ppu_obj.currentVRamAddr.coarseYScroll, palette_to_rgb_table[ppuMem[0x3F00 + (4 * paletteIndex) + paletteColorIndex]]);
+                ppu_obj.paletteShiftRHi >>= 1;
+                ppu_obj.paletteShiftRLo >>= 1;
+                ppu_obj.patternShiftRHi <<= 1;
+                ppu_obj.patternShiftRLo <<= 1;
+                ppu_obj.currentVRamAddr.coarseXScroll++;
+                if (t == 0x1F)
+                    ppu_obj.currentVRamAddr.coarseYScroll++;
+                loadTwoTiles();
+            }
+completion:
+            //uint64_t took = timestamp() - time;
+            //printf("Completed emulation for scanline %i in %li us! (%f%% of time used, %lli instructions executed total)\n", s, took, took / 0.64, instructionCount);
+            while (timestamp() - time < SCANLINE_LENGTH_US); // wait for alloted scanline time to finish (if needed)
         }
-        cpuCyclesEmulated = 0;
-        //printEmulatorOverview();
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glDrawPixels(SCREEN_WIDTH, SCREEN_HEIGHT, GL_RGB, GL_UNSIGNED_BYTE, screenBuffer);
+        glfwSwapBuffers(window);
+
+        glfwWaitEvents();
     }
 
     glfwTerminate();
@@ -355,9 +445,9 @@ int main()
 
 int safeExit(int code)
 {
-    free(cpu);
+    free(cpuMem);
     feInfo("Emulated CPU memory has been freed");
-    free(ppu);
+    free(ppuMem);
     feInfo("Emulated PPU memory has been freed");
     return code;
 }
@@ -434,12 +524,12 @@ int loadROM(FILE* file)
             feROMErr("End of file");
             return -1;
         }
-        cpu[i + CPU_PRG_OFFSET] = (unsigned char) c;
+        cpuMem[i + CPU_PRG_OFFSET] = (unsigned char) c;
         if (prgSize == 1) // mirror it for 16kb PRG
-            cpu[i + 0x4000 + CPU_PRG_OFFSET] = (unsigned char) c;
+            cpuMem[i + 0x4000 + CPU_PRG_OFFSET] = (unsigned char) c;
     }
     // Load Reset address from vector
-    pc = combineBytes(cpu[CPU_PRG_OFFSET - 0x10 + 0xC + (0x4000 * prgSize)], cpu[CPU_PRG_OFFSET - 0x10 + 0xD + (0x4000 * prgSize)]);
+    pc = combineBytes(cpuMem[CPU_PRG_OFFSET - 0x10 + 0xC + (0x4000 * prgSize)], cpuMem[CPU_PRG_OFFSET - 0x10 + 0xD + (0x4000 * prgSize)]);
     printf("Reset from $%x\n", pc);
     // Copy CHR data into emulated PPU memory
     for (int i = 0; i < chrSize * 0x2000; i++)
@@ -450,7 +540,7 @@ int loadROM(FILE* file)
             feROMErr("End of file");
             return -1;
         }
-        ppu[i] = (unsigned char) c;
+        ppuMem[i] = (unsigned char) c;
     }
     // PlayChoice data discarded
     feInfo("Loaded ROM successfully");
@@ -459,7 +549,7 @@ int loadROM(FILE* file)
 
 int executeCurrentInstruction()
 {
-    unsigned char opcode = cpu[pc];
+    unsigned char opcode = cpuMem[pc];
     cpuCyclesEmulated += cycle_count_table[opcode];
     //printf("Executing instruction with opcode $%x (pc: $%x)\n", opcode, pc);
     switch (opcode)
@@ -471,17 +561,17 @@ int executeCurrentInstruction()
         }
         case ORA_X_IND:
         {
-            m6502ora_m(readAddr(regX + cpu[pc + 1]), IND_SIZE);
+            m6502ora_m(readAddr(regX + cpuMem[pc + 1]), IND_SIZE);
             break;
         }
         case ORA_ZP:
         {
-            m6502ora_m(cpu[pc + 1], ZP_SIZE);
+            m6502ora_m(cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case ASL_ZP:
         {
-            m6502asl_m(cpu[pc + 1], ZP_SIZE);
+            m6502asl_m(cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case PHP:
@@ -492,7 +582,7 @@ int executeCurrentInstruction()
         }
         case ORA_IMM:
         {
-            m6502ora_i(cpu[pc + 1]);
+            m6502ora_i(cpuMem[pc + 1]);
             break;
         }
         case ASL_A:
@@ -522,17 +612,17 @@ int executeCurrentInstruction()
         }
         case ORA_Y_IND:
         {
-            m6502ora_m(readAddr(cpu[pc + 1]) + regY, IND_SIZE);
+            m6502ora_m(readAddr(cpuMem[pc + 1]) + regY, IND_SIZE);
             break;
         }
         case ORA_ZP_X:
         {
-            m6502ora_m(regX + cpu[pc + 1], ZP_SIZE);
+            m6502ora_m(regX + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case ASL_ZP_X:
         {
-            m6502asl_m(regX + cpu[pc + 1], ZP_SIZE);
+            m6502asl_m(regX + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case CLC:
@@ -561,22 +651,22 @@ int executeCurrentInstruction()
         }
         case AND_X_IND:
         {
-            m6502and_m(readAddr(regX + cpu[pc + 1]), IND_SIZE);
+            m6502and_m(readAddr(regX + cpuMem[pc + 1]), IND_SIZE);
             break;
         }
         case BIT_ZP:
         {
-            m6502bit(cpu[pc + 1], ZP_SIZE);
+            m6502bit(cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case AND_ZP:
         {
-            m6502and_m(cpu[pc + 1], ZP_SIZE);
+            m6502and_m(cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case ROL_ZP:
         {
-            m6502rol_m(cpu[pc + 1], ZP_SIZE);
+            m6502rol_m(cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case PLP:
@@ -587,7 +677,7 @@ int executeCurrentInstruction()
         }
         case AND_IMM:
         {
-            m6502and_i(cpu[pc + 1]);
+            m6502and_i(cpuMem[pc + 1]);
             break;
         }
         case ROL_A:
@@ -622,17 +712,17 @@ int executeCurrentInstruction()
         }
         case AND_Y_IND:
         {
-            m6502and_m(readAddr(cpu[pc + 1]) + regY, IND_SIZE);
+            m6502and_m(readAddr(cpuMem[pc + 1]) + regY, IND_SIZE);
             break;
         }
         case AND_ZP_X:
         {
-            m6502and_m(regX + cpu[pc + 1], ZP_SIZE);
+            m6502and_m(regX + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case ROL_ZP_X:
         {
-            m6502rol_m(regX + cpu[pc + 1], ZP_SIZE);
+            m6502rol_m(regX + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case SEC:
@@ -655,22 +745,24 @@ int executeCurrentInstruction()
         case RTI:
         {
             flags = m6502pullStack();
-            pc = m6502pullStack();
+            unsigned char lo = m6502pullStack();
+            unsigned char hi = m6502pullStack();
+            pc = combineBytes(lo, hi);
             break;
         }
         case EOR_X_IND:
         {
-            m6502eor_m(readAddr(regX + cpu[pc + 1]), IND_SIZE);
+            m6502eor_m(readAddr(regX + cpuMem[pc + 1]), IND_SIZE);
             break;
         }
         case EOR_ZP:
         {
-            m6502eor_m(cpu[pc + 1], ZP_SIZE);
+            m6502eor_m(cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case LSR_ZP:
         {
-            m6502lsr_m(cpu[pc + 1], ZP_SIZE);
+            m6502lsr_m(cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case PHA:
@@ -681,7 +773,7 @@ int executeCurrentInstruction()
         }
         case EOR_IMM:
         {
-            m6502eor_i(cpu[pc + 1]);
+            m6502eor_i(cpuMem[pc + 1]);
             break;
         }
         case LSR_A:
@@ -716,17 +808,17 @@ int executeCurrentInstruction()
         }
         case EOR_Y_IND:
         {
-            m6502eor_m(readAddr(cpu[pc + 1]) + regY, IND_SIZE);
+            m6502eor_m(readAddr(cpuMem[pc + 1]) + regY, IND_SIZE);
             break;
         }
         case EOR_ZP_X:
         {
-            m6502eor_m(regX + cpu[pc + 1], ZP_SIZE);
+            m6502eor_m(regX + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case LSR_ZP_X:
         {
-            m6502lsr_m(regX + cpu[pc + 1], ZP_SIZE);
+            m6502lsr_m(regX + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case CLI:
@@ -756,17 +848,17 @@ int executeCurrentInstruction()
         }
         case ADC_X_IND:
         {
-            m6502adc_m(readAddr(regX + cpu[pc + 1]), IND_SIZE);
+            m6502adc_m(readAddr(regX + cpuMem[pc + 1]), IND_SIZE);
             break;
         }
         case ADC_ZP:
         {
-            m6502adc_m(cpu[pc + 1], ZP_SIZE);
+            m6502adc_m(cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case ROR_ZP:
         {
-            m6502ror_m(cpu[pc + 1], ZP_SIZE);
+            m6502ror_m(cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case PLA:
@@ -778,7 +870,7 @@ int executeCurrentInstruction()
         }
         case ADC_IMM:
         {
-            m6502adc_i(cpu[pc + 1]);
+            m6502adc_i(cpuMem[pc + 1]);
             break;
         }
         case ROR_A:
@@ -813,17 +905,17 @@ int executeCurrentInstruction()
         }
         case ADC_Y_IND:
         {
-            m6502adc_m(readAddr(cpu[pc + 1]) + regY, IND_SIZE);
+            m6502adc_m(readAddr(cpuMem[pc + 1]) + regY, IND_SIZE);
             break;
         }
         case ADC_ZP_X:
         {
-            m6502adc_m(regX + cpu[pc + 1], ZP_SIZE);
+            m6502adc_m(regX + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case ROR_ZP_X:
         {
-            m6502ror_m(regX + cpu[pc + 1], ZP_SIZE);
+            m6502ror_m(regX + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case SEI:
@@ -845,22 +937,22 @@ int executeCurrentInstruction()
         }
         case STA_X_IND:
         {
-            m6502store(&regA, readAddr(regX + cpu[pc + 1]), IND_SIZE);
+            m6502store(&regA, readAddr(regX + cpuMem[pc + 1]), IND_SIZE);
             break;
         }
         case STY_ZP:
         {
-            m6502store(&regY, cpu[pc + 1], ZP_SIZE);
+            m6502store(&regY, cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case STA_ZP:
         {
-            m6502store(&regA, cpu[pc + 1], ZP_SIZE);
+            m6502store(&regA, cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case STX_ZP:
         {
-            m6502store(&regX, cpu[pc + 1], ZP_SIZE);
+            m6502store(&regX, cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case DEY:
@@ -904,22 +996,22 @@ int executeCurrentInstruction()
         }
         case STA_Y_IND:
         {
-            m6502store(&regA, readAddr(cpu[pc + 1]) + regY, IND_SIZE);
+            m6502store(&regA, readAddr(cpuMem[pc + 1]) + regY, IND_SIZE);
             break;
         }
         case STY_ZP_X:
         {
-            m6502store(&regY, regX + cpu[pc + 1], ZP_SIZE);
+            m6502store(&regY, regX + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case STA_ZP_X:
         {
-            m6502store(&regA, regX + cpu[pc + 1], ZP_SIZE);
+            m6502store(&regA, regX + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case STX_ZP_Y:
         {
-            m6502store(&regX, regY + cpu[pc + 1], ZP_SIZE);
+            m6502store(&regX, regY + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case TYA:
@@ -944,32 +1036,32 @@ int executeCurrentInstruction()
         }
         case LDY_IMM:
         {
-            m6502load_i(&regY, cpu[pc + 1]);
+            m6502load_i(&regY, cpuMem[pc + 1]);
             break;
         }
         case LDA_X_IND:
         {
-            m6502load_m(&regA, readAddr(regX + cpu[pc + 1]), IND_SIZE);
+            m6502load_m(&regA, readAddr(regX + cpuMem[pc + 1]), IND_SIZE);
             break;
         }
         case LDX_IMM:
         {
-            m6502load_i(&regX, cpu[pc + 1]);
+            m6502load_i(&regX, cpuMem[pc + 1]);
             break;
         }
         case LDY_ZP:
         {
-            m6502load_m(&regY, cpu[pc + 1], ZP_SIZE);
+            m6502load_m(&regY, cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case LDA_ZP:
         {
-            m6502load_m(&regA, cpu[pc + 1], ZP_SIZE);
+            m6502load_m(&regA, cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case LDX_ZP:
         {
-            m6502load_m(&regX, cpu[pc + 1], ZP_SIZE);
+            m6502load_m(&regX, cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case TAY:
@@ -981,7 +1073,7 @@ int executeCurrentInstruction()
         }
         case LDA_IMM:
         {
-            m6502load_i(&regA, cpu[pc + 1]);
+            m6502load_i(&regA, cpuMem[pc + 1]);
             break;
         }
         case TAX:
@@ -1018,22 +1110,22 @@ int executeCurrentInstruction()
         }
         case LDA_Y_IND:
         {
-            m6502load_m(&regA, readAddr(cpu[pc + 1]) + regY, IND_SIZE);
+            m6502load_m(&regA, readAddr(cpuMem[pc + 1]) + regY, IND_SIZE);
             break;
         }
         case LDY_ZP_X:
         {
-            m6502load_m(&regY, regX + cpu[pc + 1], ZP_SIZE);
+            m6502load_m(&regY, regX + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case LDA_ZP_X:
         {
-            m6502load_m(&regA, regX + cpu[pc + 1], ZP_SIZE);
+            m6502load_m(&regA, regX + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case LDX_ZP_Y:
         {
-            m6502load_m(&regX, regY + cpu[pc + 1], ZP_SIZE);
+            m6502load_m(&regX, regY + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case CLV:
@@ -1067,27 +1159,27 @@ int executeCurrentInstruction()
         }
         case CPY_IMM:
         {
-            m6502cmp_i(&regY, cpu[pc + 1]);
+            m6502cmp_i(&regY, cpuMem[pc + 1]);
             break;
         }
         case CMP_X_IND:
         {
-            m6502cmp_m(&regA, readAddr(regX + cpu[pc + 1]), IND_SIZE);
+            m6502cmp_m(&regA, readAddr(regX + cpuMem[pc + 1]), IND_SIZE);
             break;
         }
         case CPY_ZP:
         {
-            m6502cmp_m(&regY, cpu[pc + 1], ZP_SIZE);
+            m6502cmp_m(&regY, cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case CMP_ZP:
         {
-            m6502cmp_m(&regA, cpu[pc + 1], ZP_SIZE);
+            m6502cmp_m(&regA, cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case DEC_ZP:
         {
-            m6502dec(cpu[pc + 1], ZP_SIZE);
+            m6502dec(cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case INY:
@@ -1099,7 +1191,7 @@ int executeCurrentInstruction()
         }
         case CMP_IMM:
         {
-            m6502cmp_i(&regA, cpu[pc + 1]);
+            m6502cmp_i(&regA, cpuMem[pc + 1]);
             break;
         }
         case DEX:
@@ -1136,17 +1228,17 @@ int executeCurrentInstruction()
         }
         case CMP_Y_IND:
         {
-            m6502cmp_m(&regA, readAddr(cpu[pc + 1]) + regY, IND_SIZE);
+            m6502cmp_m(&regA, readAddr(cpuMem[pc + 1]) + regY, IND_SIZE);
             break;
         }
         case CMP_ZP_X:
         {
-            m6502cmp_m(&regA, regX + cpu[pc + 1], ZP_SIZE);
+            m6502cmp_m(&regA, regX + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case DEC_ZP_X:
         {
-            m6502dec(regX + cpu[pc + 1], ZP_SIZE);
+            m6502dec(regX + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case CLD:
@@ -1172,27 +1264,27 @@ int executeCurrentInstruction()
         }
         case CPX_IMM:
         {
-            m6502cmp_i(&regX, cpu[pc + 1]);
+            m6502cmp_i(&regX, cpuMem[pc + 1]);
             break;
         }
         case SBC_X_IND:
         {
-            m6502sbc_m(readAddr(regX + cpu[pc + 1]), IND_SIZE);
+            m6502sbc_m(readAddr(regX + cpuMem[pc + 1]), IND_SIZE);
             break;
         }
         case CPX_ZP:
         {
-            m6502cmp_m(&regX, cpu[pc + 1], ZP_SIZE);
+            m6502cmp_m(&regX, cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case SBC_ZP:
         {
-            m6502sbc_m(cpu[pc + 1], ZP_SIZE);
+            m6502sbc_m(cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case INC_ZP:
         {
-            m6502inc(cpu[pc + 1], ZP_SIZE);
+            m6502inc(cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case INX:
@@ -1204,7 +1296,7 @@ int executeCurrentInstruction()
         }
         case SBC_IMM:
         {
-            m6502sbc_i(cpu[pc + 1]);
+            m6502sbc_i(cpuMem[pc + 1]);
             break;
         }
         case NOP:
@@ -1239,17 +1331,17 @@ int executeCurrentInstruction()
         }
         case SBC_Y_IND:
         {
-            m6502sbc_m(readAddr(cpu[pc + 1]) + regY, IND_SIZE);
+            m6502sbc_m(readAddr(cpuMem[pc + 1]) + regY, IND_SIZE);
             break;
         }
         case SBC_ZP_X:
         {
-            m6502sbc_m(regX + cpu[pc + 1], ZP_SIZE);
+            m6502sbc_m(regX + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case INC_ZP_X:
         {
-            m6502inc(regX + cpu[pc + 1], ZP_SIZE);
+            m6502inc(regX + cpuMem[pc + 1], ZP_SIZE);
             break;
         }
         case SED:
@@ -1275,7 +1367,7 @@ int executeCurrentInstruction()
         }
         default:
         {
-            feErr("Attempted to execute unknown instruction");
+            printf("Attempted to execute unknown instruction (opcode $%x)\n", opcode);
             return -1;
         }
     }
@@ -1286,7 +1378,7 @@ int executeCurrentInstruction()
 // Reads a little endian 16-bit address at addr
 unsigned short readAddr(unsigned short addr)
 {
-    return (((unsigned short) cpu[addr + 1]) << 8) | ((unsigned short) cpu[addr]);
+    return (((unsigned short) cpuMem[addr + 1]) << 8) | ((unsigned short) cpuMem[addr]);
 }
 
 void setFlag(int bit)
@@ -1315,7 +1407,12 @@ int flipFlag(int bit)
 
 int isFlagSet(int bit)
 {
-    return (flags & (1 << bit)) != 0;
+    return isBitSet(flags, bit);
+}
+
+int isBitSet(unsigned char field, int bit)
+{
+    return (field & (1 << bit)) != 0;
 }
 
 void updateFlagConditionally(int condition, int bit)
@@ -1344,19 +1441,27 @@ void updateSignFlags(unsigned char c)
 
 void m6502pushStack(unsigned char c)
 {
-    cpu[((unsigned short) 0x0100) + ((unsigned short) regS--)] = c;
+    cpuMem[((unsigned short) 0x0100) + ((unsigned short) regS--)] = c;
 }
 
 unsigned char m6502pullStack()
 {
-    return cpu[((unsigned short) 0x0100) + ((unsigned short) ++regS)];
+    return cpuMem[((unsigned short) 0x0100) + ((unsigned short) ++regS)];
 }
 
 // pc should be on the branch instruction
 void m6502branch()
 {
     pc += 2;
-    pc += (char) cpu[pc - 1];
+    pc += (char) cpuMem[pc - 1];
+}
+
+void m6502interrupt(unsigned short addr)
+{
+    m6502pushStack(hiByte(pc));
+    m6502pushStack(loByte(pc));
+    m6502pushStack(flags);
+    m6502jmp(addr);
 }
 
 void m6502jmp(unsigned short addr)
@@ -1366,9 +1471,9 @@ void m6502jmp(unsigned short addr)
 
 void m6502asl_m(unsigned short mem, int sz)
 {
-    updateFlagConditionally((cpu[mem] & 0b10000000) != 0, CARRY_FLAG);
-    cpu[mem] <<= 1;
-    updateSignFlags(cpu[mem]);
+    updateFlagConditionally((cpuMem[mem] & 0b10000000) != 0, CARRY_FLAG);
+    cpuMem[mem] <<= 1;
+    updateSignFlags(cpuMem[mem]);
     pc += sz;
 }
 
@@ -1382,9 +1487,9 @@ void m6502asl_a()
 
 void m6502lsr_m(unsigned short mem, int sz)
 {
-    updateFlagConditionally((cpu[mem] & 0b00000001) != 0, CARRY_FLAG);
-    cpu[mem] >>= 1;
-    updateSignFlags(cpu[mem]);
+    updateFlagConditionally((cpuMem[mem] & 0b00000001) != 0, CARRY_FLAG);
+    cpuMem[mem] >>= 1;
+    updateSignFlags(cpuMem[mem]);
     pc += sz;
 }
 
@@ -1399,10 +1504,10 @@ void m6502lsr_a()
 void m6502rol_m(unsigned short mem, int sz)
 {
     int c = isFlagSet(CARRY_FLAG);
-    updateFlagConditionally((cpu[mem] & 0b10000000) != 0, CARRY_FLAG);
-    cpu[mem] <<= 1;
-    cpu[mem] = (cpu[mem] & ~1) | c;
-    updateSignFlags(cpu[mem]);
+    updateFlagConditionally((cpuMem[mem] & 0b10000000) != 0, CARRY_FLAG);
+    cpuMem[mem] <<= 1;
+    cpuMem[mem] = (cpuMem[mem] & ~1) | c;
+    updateSignFlags(cpuMem[mem]);
     pc += sz;
 }
 
@@ -1419,10 +1524,10 @@ void m6502rol_a()
 void m6502ror_m(unsigned short mem, int sz)
 {
     int c = isFlagSet(CARRY_FLAG);
-    updateFlagConditionally((cpu[mem] & 0b00000001) != 0, CARRY_FLAG);
-    cpu[mem] >>= 1;
-    cpu[mem] = (cpu[mem] | (c << 7));
-    updateSignFlags(cpu[mem]);
+    updateFlagConditionally((cpuMem[mem] & 0b00000001) != 0, CARRY_FLAG);
+    cpuMem[mem] >>= 1;
+    cpuMem[mem] = (cpuMem[mem] | (c << 7));
+    updateSignFlags(cpuMem[mem]);
     pc += sz;
 }
 
@@ -1438,7 +1543,7 @@ void m6502ror_a()
 
 void m6502ora_m(unsigned short mem, int sz)
 {
-    regA |= cpu[mem];
+    regA |= cpuMem[mem];
     updateSignFlags(regA);
     pc += sz;
 }
@@ -1452,7 +1557,7 @@ void m6502ora_i(unsigned char i)
 
 void m6502and_m(unsigned short mem, int sz)
 {
-    regA &= cpu[mem];
+    regA &= cpuMem[mem];
     updateSignFlags(regA);
     pc += sz;
 }
@@ -1466,7 +1571,7 @@ void m6502and_i(unsigned char i)
 
 void m6502eor_m(unsigned short mem, int sz)
 {
-    regA ^= cpu[mem];
+    regA ^= cpuMem[mem];
     updateSignFlags(regA);
     pc += sz;
 }
@@ -1482,12 +1587,12 @@ void m6502eor_i(unsigned char i)
 
 void m6502adc_m(unsigned short mem, int sz)
 {
-    unsigned short sum = (unsigned short) regA + (unsigned short) cpu[mem] + isFlagSet(CARRY_FLAG);
+    unsigned short sum = (unsigned short) regA + (unsigned short) cpuMem[mem] + isFlagSet(CARRY_FLAG);
     if (sum > 0xFF)
         setFlag(CARRY_FLAG);
-    if (~(regA ^ cpu[mem]) & (regA ^ sum) & 0x80) // *
+    if (~(regA ^ cpuMem[mem]) & (regA ^ sum) & 0x80) // *
         setFlag(OVERFLOW_FLAG);
-    regA += cpu[mem] + ((unsigned char) isFlagSet(CARRY_FLAG));
+    regA = sum;
     updateSignFlags(regA);
     pc += sz;
 }
@@ -1499,19 +1604,19 @@ void m6502adc_i(unsigned char i)
         setFlag(CARRY_FLAG);
     if (~(regA ^ i) & (regA ^ sum) & 0x80) // *
         setFlag(OVERFLOW_FLAG);
-    regA += i + ((unsigned char) isFlagSet(CARRY_FLAG));
+    regA = sum;
     updateSignFlags(regA);
     pc += 2;
 }
 
 void m6502sbc_m(unsigned short mem, int sz)
 {
-    unsigned short sum = (unsigned short) regA + (unsigned short) ~(cpu[mem]) + isFlagSet(CARRY_FLAG);
+    unsigned short sum = (unsigned short) regA + (unsigned short) ~(cpuMem[mem]) + isFlagSet(CARRY_FLAG);
     if (sum > 0xFF)
         setFlag(CARRY_FLAG);
-    if (~(regA ^ ~(cpu[mem])) & (regA ^ sum) & 0x80) // *
+    if (~(regA ^ ~(cpuMem[mem])) & (regA ^ sum) & 0x80) // *
         setFlag(OVERFLOW_FLAG);
-    regA += ~(cpu[mem]) + ((unsigned char) isFlagSet(CARRY_FLAG));
+    regA = sum;
     updateSignFlags(regA);
     pc += sz;
 }
@@ -1523,21 +1628,68 @@ void m6502sbc_i(unsigned char i)
 
 void m6502bit(unsigned short mem, int sz)
 {
-    flags = (flags & 0b00111111) | (cpu[mem] & 0b11000000);
+    flags = (flags & 0b00111111) | (cpuMem[mem] & 0b11000000);
     updateZeroFlag(mem & regA);
     pc += sz;
 }
 
 void m6502store(unsigned char* r, unsigned short mem, int sz)
 {
-    cpu[mem] = *r;
+    cpuMem[mem] = *r;
+    if (mem == PPUSCROLL)
+    {
+        if (ppu_obj.writeToggle) // changing y scroll
+        {
+            ppu_obj.currentVRamAddr.coarseYScroll = *r / 8;
+            ppu_obj.currentVRamAddr.fineYScroll = *r % 8;
+            ppu_obj.writeToggle = 0;
+        }
+        else
+        {
+            ppu_obj.currentVRamAddr.coarseXScroll = *r / 8;
+            ppu_obj.fineXScroll = *r % 8;
+            ppu_obj.writeToggle = 1;
+        }
+    }
+    if (mem == PPUADDR) // some goofy bit mirroring because i was lazy earlier
+    {
+        if (ppu_obj.writeToggle) // write latch set, low byte being updated
+        {
+            ppu_obj.currentVRamAddr.exactAddr = (ppu_obj.currentVRamAddr.exactAddr & 0x3F00) | *r;
+            //ppu_obj.currentVRamAddr.fineYScroll = ppu_obj.currentVRamAddr.exactAddr >> 12;
+            //ppu_obj.currentVRamAddr.nametableSelect = (ppu_obj.currentVRamAddr.exactAddr >> 10) & 0b11;
+            //ppu_obj.currentVRamAddr.coarseYScroll = (ppu_obj.currentVRamAddr.coarseYScroll & 0b111) | (((ppu_obj.currentVRamAddr.exactAddr >> 8) & 0b11) << 3);
+            ppu_obj.writeToggle = 0;
+        }
+        else
+        {
+            ppu_obj.currentVRamAddr.exactAddr = (ppu_obj.currentVRamAddr.exactAddr & 0xFF) | (((unsigned short) *r) << 8);
+            //pu_obj.currentVRamAddr.coarseYScroll = (ppu_obj.currentVRamAddr.coarseYScroll & 0b11000) | ((ppu_obj.currentVRamAddr.exactAddr >> 5) & 0b111);
+            //ppu_obj.currentVRamAddr.coarseXScroll = ppu_obj.currentVRamAddr.exactAddr & 0b11111;
+            ppu_obj.writeToggle = 1;
+        }
+    }
+    if (mem == PPUDATA)
+    {
+        printf("PPUDATA: 0x%x stored in 0x%x (pc: $%x)\n", *r, ppu_obj.currentVRamAddr.exactAddr, pc);
+        printBin(cpuMem[PPUCTRL]);
+        ppuMem[ppu_obj.currentVRamAddr.exactAddr] = *r;
+        if(isBitSet(cpuMem[PPUCTRL], VRAM_INC_BIT))
+            ppu_obj.currentVRamAddr.exactAddr += 0x20;
+        else
+            ppu_obj.currentVRamAddr.exactAddr++;
+    }
     pc += sz;
 }
 
 void m6502load_m(unsigned char* r, unsigned short mem, int sz)
 {
-    *r = cpu[mem];
+    if (mem == 0x1898)
+        printEmulatorOverview();
+    *r = cpuMem[mem];
     updateSignFlags(*r);
+    if (mem == PPUSTATUS)
+        ppu_obj.writeToggle = 0; // reset address latch
     pc += sz;
 }
 
@@ -1550,9 +1702,9 @@ void m6502load_i(unsigned char* r, unsigned char i)
 
 void m6502cmp_m(unsigned char* r, unsigned short mem, int sz)
 {
-    if (*r >= cpu[mem])
+    if (*r >= cpuMem[mem])
         setFlag(CARRY_FLAG);
-    updateSignFlags((char) *r - (char) cpu[mem]);
+    updateSignFlags((char) *r - (char) cpuMem[mem]);
     pc += sz;
 }
 
@@ -1566,15 +1718,15 @@ void m6502cmp_i(unsigned char* r, unsigned char i)
 
 void m6502inc(unsigned short mem, int sz)
 {
-    cpu[mem]++;
-    updateSignFlags(cpu[mem]);
+    cpuMem[mem]++;
+    updateSignFlags(cpuMem[mem]);
     pc += sz;
 }
 
 void m6502dec(unsigned short mem, int sz)
 {
-    cpu[mem]--;
-    updateSignFlags(cpu[mem]);
+    cpuMem[mem]--;
+    updateSignFlags(cpuMem[mem]);
     pc += sz;
 }
 
@@ -1634,4 +1786,40 @@ uint64_t timestamp()
     struct timeval tv;
     gettimeofday(&tv,NULL);
     return tv.tv_sec*(uint64_t)1000000+tv.tv_usec;
+}
+
+void loadTwoTiles()
+{
+    // nametable 0 base + nametable offset + coarse y offset + coarse x offset
+    unsigned short nametableIndex = (0x20 * ppu_obj.currentVRamAddr.coarseYScroll) + (ppu_obj.currentVRamAddr.coarseXScroll);
+    unsigned short tileAddr = 0x2000 + (ppu_obj.currentVRamAddr.nametableSelect * 0x400) + nametableIndex;
+    // fine y offset
+    int startLine = ppu_obj.currentVRamAddr.fineYScroll;
+    unsigned short patternTableAddr = ((((unsigned short) ppuMem[tileAddr]) << 4) | startLine);
+    ppu_obj.patternShiftRHi = ppuMem[patternTableAddr + 8];
+    ppu_obj.patternShiftRLo = ppuMem[patternTableAddr];
+    // attr table 0 base + attr table offset 
+    unsigned short attrAddr = 0x23C0 + (ppu_obj.currentVRamAddr.nametableSelect * 0x400) + ((nametableIndex / 0x80) * 8) + ((nametableIndex / 4) % 8);
+    ppu_obj.paletteShiftRHi = ppu_obj.paletteShiftRLo = 0;
+    unsigned char loAttrBitIndex = ((1 << (4 * ((nametableIndex / 0x40) % 2)))) << (2 * ((nametableIndex / 0x02) % 2));
+    if (ppuMem[attrAddr] & (loAttrBitIndex << 1))
+        ppu_obj.paletteShiftRHi = ~ppu_obj.paletteShiftRHi;
+    if (ppuMem[attrAddr] & loAttrBitIndex)
+        ppu_obj.paletteShiftRLo = ~ppu_obj.paletteShiftRLo;
+    //printf("0x%x, %x, %x, %x, %x, %x\n", tileAddr, ppuMem[tileAddr], ppu_obj.patternShiftRHi, ppu_obj.patternShiftRLo, ppu_obj.paletteShiftRHi, ppu_obj.paletteShiftRLo);
+}
+
+unsigned short inc5BitInt(unsigned short addr, int offset)
+{
+    unsigned short bi = ((addr >> offset) & 0b11111);
+    bi++;
+    if (bi > 0b11111) bi = 0;
+    return (addr & (~(((unsigned short) 0b11111) << offset))) | (bi << offset);
+}
+
+void updatePixel(int x, int y, int rgb)
+{
+    screenBuffer[(y * 3 * SCREEN_WIDTH) + (x * 3)] = (unsigned char) (rgb >> 16);
+    screenBuffer[(y * 3 * SCREEN_WIDTH) + (x * 3) + 1] = (unsigned char) (rgb >> 8);
+    screenBuffer[(y * 3 * SCREEN_WIDTH) + (x * 3) + 2] = (unsigned char) rgb;
 }
