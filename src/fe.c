@@ -1,4 +1,4 @@
-#include <GLFW/glfw3.h>
+#include <SDL2/SDL.h>
 #include <sys/time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -275,10 +275,12 @@ unsigned short pc = 0x0000;
 unsigned char regA, regX, regY, regS;
 unsigned char flags;
 
-unsigned char* screenBuffer;
-
 unsigned long long instructionCount = 0;
 unsigned short cpuCyclesEmulated = 0;
+unsigned char overviewAfterInstruction = 0;
+
+SDL_Window* window = NULL;
+SDL_Surface* screenSurface = NULL;
 
 int safeExit();
 void feInfo(const char* message);
@@ -340,7 +342,7 @@ void m6502jmp(unsigned short addr);
 void m6502inc(unsigned short mem, int sz);
 void m6502dec(unsigned short mem, int sz);
 
-int main()
+int WinMain(int argc, char* argv[])
 {
     regA = regX = regY = regS = flags = (unsigned char) 0;
     // Create CPU and PPU memory
@@ -348,7 +350,6 @@ int main()
     feInfo("Created emulated CPU memory");
     ppuMem = malloc(PPU_SIZE);
     feInfo("Created emulated PPU memory");
-    screenBuffer = malloc(SCREEN_WIDTH * SCREEN_HEIGHT * 3);
 
     // Initialize PPU registers
     cpuMem[PPUCTRL] = 0;
@@ -370,24 +371,21 @@ int main()
     if (rom == -1)
         return safeExit(-1);
 
-    GLFWwindow* window;
-
-    if (!glfwInit())
+    if (SDL_Init(SDL_INIT_VIDEO) < 0)
     {
-        feErr("Could not initialize GLFW");
+        printf("SDL could not initialize! (%s)\n", SDL_GetError());
         return safeExit(-1);
     }
 
-    window = glfwCreateWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "FE", NULL, NULL);
-    if (!window)
+    window = SDL_CreateWindow("FE", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, SCREEN_WIDTH, SCREEN_HEIGHT, SDL_WINDOW_SHOWN);
+    if (window == NULL)
     {
-        glfwTerminate();
+        printf("Window could not be created! (%s)\n", SDL_GetError());
         return safeExit(-1);
     }
+    screenSurface = SDL_GetWindowSurface(window);
 
-    glfwMakeContextCurrent(window);
-
-    while (!glfwWindowShouldClose(window))
+    for (SDL_Event e; e.type != SDL_QUIT; SDL_PollEvent(&e))
     {
         for (int s = -1; s < SCANLINES - 1; s++)
         {
@@ -432,19 +430,15 @@ completion:
             //printf("Completed emulation for scanline %i in %li us! (%f%% of time used, %lli instructions executed total)\n", s, took, took / 0.64, instructionCount);
             while (timestamp() - time < SCANLINE_LENGTH_US); // wait for alloted scanline time to finish (if needed)
         }
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        glDrawPixels(SCREEN_WIDTH, SCREEN_HEIGHT, GL_RGB, GL_UNSIGNED_BYTE, screenBuffer);
-        glfwSwapBuffers(window);
-
-        glfwWaitEvents();
+        SDL_UpdateWindowSurface(window);
     }
-
-    glfwTerminate();
     return safeExit(0);
 }
 
 int safeExit(int code)
 {
+    SDL_DestroyWindow(window);
+    SDL_Quit();
     free(cpuMem);
     feInfo("Emulated CPU memory has been freed");
     free(ppuMem);
@@ -1371,6 +1365,8 @@ int executeCurrentInstruction()
             return -1;
         }
     }
+    if (overviewAfterInstruction)
+        printEmulatorOverview();
     instructionCount++;
     return 0;
 }
@@ -1471,7 +1467,7 @@ void m6502jmp(unsigned short addr)
 
 void m6502asl_m(unsigned short mem, int sz)
 {
-    updateFlagConditionally((cpuMem[mem] & 0b10000000) != 0, CARRY_FLAG);
+    updateFlagConditionally(isBitSet(cpuMem[mem], 7), CARRY_FLAG);
     cpuMem[mem] <<= 1;
     updateSignFlags(cpuMem[mem]);
     pc += sz;
@@ -1479,7 +1475,7 @@ void m6502asl_m(unsigned short mem, int sz)
 
 void m6502asl_a()
 {
-    updateFlagConditionally((regA & 0b10000000) != 0, CARRY_FLAG);
+    updateFlagConditionally(isBitSet(regA, 7), CARRY_FLAG);
     regA <<= 1;
     updateSignFlags(regA);
     pc++;
@@ -1487,7 +1483,7 @@ void m6502asl_a()
 
 void m6502lsr_m(unsigned short mem, int sz)
 {
-    updateFlagConditionally((cpuMem[mem] & 0b00000001) != 0, CARRY_FLAG);
+    updateFlagConditionally(isBitSet(cpuMem[mem], 0), CARRY_FLAG);
     cpuMem[mem] >>= 1;
     updateSignFlags(cpuMem[mem]);
     pc += sz;
@@ -1495,7 +1491,7 @@ void m6502lsr_m(unsigned short mem, int sz)
 
 void m6502lsr_a()
 {
-    updateFlagConditionally((regA & 0b00000001) != 0, CARRY_FLAG);
+    updateFlagConditionally(isBitSet(regA, 0), CARRY_FLAG);
     regA >>= 1;
     updateSignFlags(regA);
     pc++;
@@ -1503,28 +1499,28 @@ void m6502lsr_a()
 
 void m6502rol_m(unsigned short mem, int sz)
 {
-    int c = isFlagSet(CARRY_FLAG);
-    updateFlagConditionally((cpuMem[mem] & 0b10000000) != 0, CARRY_FLAG);
+    unsigned char c = (unsigned char) isFlagSet(CARRY_FLAG);
+    updateFlagConditionally(isBitSet(cpuMem[mem], 7), CARRY_FLAG);
     cpuMem[mem] <<= 1;
-    cpuMem[mem] = (cpuMem[mem] & ~1) | c;
+    cpuMem[mem] = ((cpuMem[mem] & ~1) | c);
     updateSignFlags(cpuMem[mem]);
     pc += sz;
 }
 
 void m6502rol_a()
 {
-    int c = isFlagSet(CARRY_FLAG);
-    updateFlagConditionally((regA & 0b10000000) != 0, CARRY_FLAG);
+    unsigned char c = (unsigned char) isFlagSet(CARRY_FLAG);
+    updateFlagConditionally(isBitSet(regA, 7), CARRY_FLAG);
     regA <<= 1;
-    regA = (regA & ~1) | c;
+    regA = ((regA & ~1) | c);
     updateSignFlags(regA);
     pc++;
 }
 
 void m6502ror_m(unsigned short mem, int sz)
 {
-    int c = isFlagSet(CARRY_FLAG);
-    updateFlagConditionally((cpuMem[mem] & 0b00000001) != 0, CARRY_FLAG);
+    unsigned char c = (unsigned char) isFlagSet(CARRY_FLAG);
+    updateFlagConditionally(isBitSet(cpuMem[mem], 0), CARRY_FLAG);
     cpuMem[mem] >>= 1;
     cpuMem[mem] = (cpuMem[mem] | (c << 7));
     updateSignFlags(cpuMem[mem]);
@@ -1533,8 +1529,8 @@ void m6502ror_m(unsigned short mem, int sz)
 
 void m6502ror_a()
 {
-    int c = isFlagSet(CARRY_FLAG);
-    updateFlagConditionally((regA & 0b00000001) != 0, CARRY_FLAG);
+    unsigned char c = (unsigned char) isFlagSet(CARRY_FLAG);
+    updateFlagConditionally(isBitSet(regA, 0), CARRY_FLAG);
     regA >>= 1;
     regA = (regA | (c << 7));
     updateSignFlags(regA);
@@ -1588,10 +1584,8 @@ void m6502eor_i(unsigned char i)
 void m6502adc_m(unsigned short mem, int sz)
 {
     unsigned short sum = (unsigned short) regA + (unsigned short) cpuMem[mem] + isFlagSet(CARRY_FLAG);
-    if (sum > 0xFF)
-        setFlag(CARRY_FLAG);
-    if (~(regA ^ cpuMem[mem]) & (regA ^ sum) & 0x80) // *
-        setFlag(OVERFLOW_FLAG);
+    updateFlagConditionally(sum > 0xFF, CARRY_FLAG);
+    updateFlagConditionally(~(regA ^ cpuMem[mem]) & (regA ^ sum) & 0x80, OVERFLOW_FLAG);
     regA = sum;
     updateSignFlags(regA);
     pc += sz;
@@ -1600,10 +1594,8 @@ void m6502adc_m(unsigned short mem, int sz)
 void m6502adc_i(unsigned char i)
 {
     unsigned short sum = (unsigned short) regA + (unsigned short) i + isFlagSet(CARRY_FLAG);
-    if (sum > 0xFF)
-        setFlag(CARRY_FLAG);
-    if (~(regA ^ i) & (regA ^ sum) & 0x80) // *
-        setFlag(OVERFLOW_FLAG);
+    updateFlagConditionally(sum > 0xFF, CARRY_FLAG);
+    updateFlagConditionally(~(regA ^ i) & (regA ^ sum) & 0x80, OVERFLOW_FLAG);
     regA = sum;
     updateSignFlags(regA);
     pc += 2;
@@ -1612,10 +1604,8 @@ void m6502adc_i(unsigned char i)
 void m6502sbc_m(unsigned short mem, int sz)
 {
     unsigned short sum = (unsigned short) regA + (unsigned short) ~(cpuMem[mem]) + isFlagSet(CARRY_FLAG);
-    if (sum > 0xFF)
-        setFlag(CARRY_FLAG);
-    if (~(regA ^ ~(cpuMem[mem])) & (regA ^ sum) & 0x80) // *
-        setFlag(OVERFLOW_FLAG);
+    updateFlagConditionally(sum > 0xFF, CARRY_FLAG);
+    updateFlagConditionally(~(regA ^ ~(cpuMem[mem])) & (regA ^ sum) & 0x80, OVERFLOW_FLAG);
     regA = sum;
     updateSignFlags(regA);
     pc += sz;
@@ -1629,7 +1619,7 @@ void m6502sbc_i(unsigned char i)
 void m6502bit(unsigned short mem, int sz)
 {
     flags = (flags & 0b00111111) | (cpuMem[mem] & 0b11000000);
-    updateZeroFlag(mem & regA);
+    updateZeroFlag(cpuMem[mem] & regA);
     pc += sz;
 }
 
@@ -1671,8 +1661,12 @@ void m6502store(unsigned char* r, unsigned short mem, int sz)
     }
     if (mem == PPUDATA)
     {
+        //if (ppu_obj.currentVRamAddr.exactAddr == 0x3f0c)
+        //    overviewAfterInstruction = 1;
+        //if (ppu_obj.currentVRamAddr.exactAddr == 0x1b24)
+        //    overviewAfterInstruction = 0;
         printf("PPUDATA: 0x%x stored in 0x%x (pc: $%x)\n", *r, ppu_obj.currentVRamAddr.exactAddr, pc);
-        printBin(cpuMem[PPUCTRL]);
+        printEmulatorOverview();
         ppuMem[ppu_obj.currentVRamAddr.exactAddr] = *r;
         if(isBitSet(cpuMem[PPUCTRL], VRAM_INC_BIT))
             ppu_obj.currentVRamAddr.exactAddr += 0x20;
@@ -1702,17 +1696,19 @@ void m6502load_i(unsigned char* r, unsigned char i)
 
 void m6502cmp_m(unsigned char* r, unsigned short mem, int sz)
 {
-    if (*r >= cpuMem[mem])
+    unsigned short sum = (unsigned short) *r + (unsigned short) ~(cpuMem[mem]) + isFlagSet(CARRY_FLAG);
+    if (sum > 0xFF)
         setFlag(CARRY_FLAG);
-    updateSignFlags((char) *r - (char) cpuMem[mem]);
+    updateSignFlags((char) (*r) - (char) (cpuMem[mem]));
     pc += sz;
 }
 
 void m6502cmp_i(unsigned char* r, unsigned char i)
 {
-    if (*r >= i)
+    unsigned short sum = (unsigned short) *r + (unsigned short) ~i + isFlagSet(CARRY_FLAG);
+    if (sum > 0xFF)
         setFlag(CARRY_FLAG);
-    updateSignFlags((char) *r - (char) i);
+    updateSignFlags((char) (*r) - (char) i);
     pc += 2;
 }
 
@@ -1732,7 +1728,7 @@ void m6502dec(unsigned short mem, int sz)
 
 unsigned char loByte(unsigned short addr)
 {
-    return (unsigned char) ((addr << 8) >> 8);
+    return (unsigned char) addr;
 }
 
 unsigned char hiByte(unsigned short addr)
@@ -1771,12 +1767,11 @@ void feROMErr(const char* message)
 
 void printBin(unsigned char c)
 {
-    char number[9];
-    number[8] = '\0';
+    char number[10];
+    number[8] = '\n';
+    number[9] = '\0';
     for (int i = 0; i < 8; i++)
-    {
-        number[7 - i] = (((c >> i) & 0b00000001) != 0) ? '1' : '0';
-    }
+        number[7 - i] = ((c >> i) & 1) ? '1' : '0';
     printf(number);
 }
 
@@ -1806,7 +1801,6 @@ void loadTwoTiles()
         ppu_obj.paletteShiftRHi = ~ppu_obj.paletteShiftRHi;
     if (ppuMem[attrAddr] & loAttrBitIndex)
         ppu_obj.paletteShiftRLo = ~ppu_obj.paletteShiftRLo;
-    //printf("0x%x, %x, %x, %x, %x, %x\n", tileAddr, ppuMem[tileAddr], ppu_obj.patternShiftRHi, ppu_obj.patternShiftRLo, ppu_obj.paletteShiftRHi, ppu_obj.paletteShiftRLo);
 }
 
 unsigned short inc5BitInt(unsigned short addr, int offset)
@@ -1819,7 +1813,9 @@ unsigned short inc5BitInt(unsigned short addr, int offset)
 
 void updatePixel(int x, int y, int rgb)
 {
-    screenBuffer[(y * 3 * SCREEN_WIDTH) + (x * 3)] = (unsigned char) (rgb >> 16);
-    screenBuffer[(y * 3 * SCREEN_WIDTH) + (x * 3) + 1] = (unsigned char) (rgb >> 8);
-    screenBuffer[(y * 3 * SCREEN_WIDTH) + (x * 3) + 2] = (unsigned char) rgb;
+    SDL_Rect rect;
+    rect.x = x;
+    rect.y = y;
+    rect.w = rect.h = 1;
+    SDL_FillRect(screenSurface, &rect, rgb);
 }
