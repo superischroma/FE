@@ -279,6 +279,8 @@ unsigned long long instructionCount = 0;
 unsigned short cpuCyclesEmulated = 0;
 unsigned char overviewAfterInstruction = 0;
 
+unsigned char upscale = 3;
+
 SDL_Window* window = NULL;
 SDL_Surface* screenSurface = NULL;
 
@@ -296,6 +298,8 @@ void clearFlag(int bit);
 int flipFlag(int bit);
 int isFlagSet(int bit);
 int isBitSet(unsigned char field, int bit);
+void setBit(unsigned char* field, int bit);
+void clearBit(unsigned char* field, int bit);
 void updateFlagConditionally(int condition, int bit);
 void updateNegativeFlag(unsigned char c);
 void updateZeroFlag(unsigned char c);
@@ -377,7 +381,7 @@ int WinMain(int argc, char* argv[])
         return safeExit(-1);
     }
 
-    window = SDL_CreateWindow("FE", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, SCREEN_WIDTH, SCREEN_HEIGHT, SDL_WINDOW_SHOWN);
+    window = SDL_CreateWindow("FE", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, SCREEN_WIDTH * upscale, SCREEN_HEIGHT * upscale, SDL_WINDOW_SHOWN);
     if (window == NULL)
     {
         printf("Window could not be created! (%s)\n", SDL_GetError());
@@ -387,6 +391,24 @@ int WinMain(int argc, char* argv[])
 
     for (SDL_Event e; e.type != SDL_QUIT; SDL_PollEvent(&e))
     {
+        if (e.type == SDL_KEYDOWN)
+        {
+            switch (e.key.keysym.sym)
+            {
+                case SDLK_x: // print out nametable 0
+                {
+                    for (unsigned short addr = 0x2000; addr < 0x23C0; addr++)
+                    {
+                        if ((addr & 0x0F) == 0x00)
+                            printf("0x%04X | ", addr);
+                        printf("%02X ", ppuMem[addr]);
+                        if ((addr & 0x0F) == 0x0F)
+                            printf("\n");
+                    }
+                    break;
+                }
+            }
+        }
         for (int s = -1; s < SCANLINES - 1; s++)
         {
             uint64_t time = timestamp();
@@ -399,7 +421,7 @@ int WinMain(int argc, char* argv[])
                 goto completion;
             if (s == POSTRENDER_SCANLINE)
             {
-                cpuMem[PPUSTATUS] |= VBLANK_BIT; // enter VBlank
+                setBit(cpuMem + PPUSTATUS, VBLANK_BIT);
                 if (isBitSet(cpuMem[PPUCTRL], NMI_BIT)) // generate NMI?
                     m6502interrupt(combineBytes(cpuMem[NMI_VECTOR], cpuMem[NMI_VECTOR + 1]));
                 goto completion;
@@ -407,24 +429,27 @@ int WinMain(int argc, char* argv[])
             if (s == PRERENDER_SCANLINE)
             {
                 loadTwoTiles(); // load the first two tiles
-                cpuMem[PPUSTATUS] &= ~VBLANK_BIT; // exit VBlank
+                clearBit(cpuMem + PPUSTATUS, VBLANK_BIT); // exit VBlank
                 goto completion;
             }
             for (int t = 0; t < 0x20; t++)
             {
-                // load pixels for the current shift registers
-                int paletteIndex = ((ppu_obj.paletteShiftRHi & 1) << 1) | (ppu_obj.paletteShiftRLo & 1);
-                int paletteColorIndex = ((ppu_obj.patternShiftRHi & (1 << 7)) >> 6) | ((ppu_obj.patternShiftRLo & (1 << 7)) >> 7);
-                updatePixel(ppu_obj.currentVRamAddr.coarseXScroll, ppu_obj.currentVRamAddr.coarseYScroll, palette_to_rgb_table[ppuMem[0x3F00 + (4 * paletteIndex) + paletteColorIndex]]);
-                ppu_obj.paletteShiftRHi >>= 1;
-                ppu_obj.paletteShiftRLo >>= 1;
-                ppu_obj.patternShiftRHi <<= 1;
-                ppu_obj.patternShiftRLo <<= 1;
+                for (int p = 0; p < 8; p++)
+                {
+                    // load pixels for the current shift registers
+                    int paletteIndex = ((ppu_obj.paletteShiftRHi & 1) << 1) | (ppu_obj.paletteShiftRLo & 1);
+                    int paletteColorIndex = ((ppu_obj.patternShiftRHi & (1 << 7)) >> 6) | ((ppu_obj.patternShiftRLo & (1 << 7)) >> 7);
+                    updatePixel((t * 8) + p, s, palette_to_rgb_table[ppuMem[0x3F00 + (4 * paletteIndex) + paletteColorIndex]]);
+                    ppu_obj.paletteShiftRHi >>= 1;
+                    ppu_obj.paletteShiftRLo >>= 1;
+                    ppu_obj.patternShiftRHi <<= 1;
+                    ppu_obj.patternShiftRLo <<= 1;
+                }
                 ppu_obj.currentVRamAddr.coarseXScroll++;
-                if (t == 0x1F)
-                    ppu_obj.currentVRamAddr.coarseYScroll++;
                 loadTwoTiles();
             }
+            if ((++ppu_obj.currentVRamAddr.fineYScroll) == 0)
+                ppu_obj.currentVRamAddr.coarseYScroll++;
 completion:
             //uint64_t took = timestamp() - time;
             //printf("Completed emulation for scanline %i in %li us! (%f%% of time used, %lli instructions executed total)\n", s, took, took / 0.64, instructionCount);
@@ -524,7 +549,6 @@ int loadROM(FILE* file)
     }
     // Load Reset address from vector
     pc = combineBytes(cpuMem[CPU_PRG_OFFSET - 0x10 + 0xC + (0x4000 * prgSize)], cpuMem[CPU_PRG_OFFSET - 0x10 + 0xD + (0x4000 * prgSize)]);
-    printf("Reset from $%x\n", pc);
     // Copy CHR data into emulated PPU memory
     for (int i = 0; i < chrSize * 0x2000; i++)
     {
@@ -1411,6 +1435,16 @@ int isBitSet(unsigned char field, int bit)
     return (field & (1 << bit)) != 0;
 }
 
+void setBit(unsigned char* field, int bit)
+{
+    *field |= (1 << bit);
+}
+
+void clearBit(unsigned char* field, int bit)
+{
+    *field &= ~(1 << bit);
+}
+
 void updateFlagConditionally(int condition, int bit)
 {
     if (condition)
@@ -1661,12 +1695,6 @@ void m6502store(unsigned char* r, unsigned short mem, int sz)
     }
     if (mem == PPUDATA)
     {
-        //if (ppu_obj.currentVRamAddr.exactAddr == 0x3f0c)
-        //    overviewAfterInstruction = 1;
-        //if (ppu_obj.currentVRamAddr.exactAddr == 0x1b24)
-        //    overviewAfterInstruction = 0;
-        printf("PPUDATA: 0x%x stored in 0x%x (pc: $%x)\n", *r, ppu_obj.currentVRamAddr.exactAddr, pc);
-        printEmulatorOverview();
         ppuMem[ppu_obj.currentVRamAddr.exactAddr] = *r;
         if(isBitSet(cpuMem[PPUCTRL], VRAM_INC_BIT))
             ppu_obj.currentVRamAddr.exactAddr += 0x20;
@@ -1790,7 +1818,7 @@ void loadTwoTiles()
     unsigned short tileAddr = 0x2000 + (ppu_obj.currentVRamAddr.nametableSelect * 0x400) + nametableIndex;
     // fine y offset
     int startLine = ppu_obj.currentVRamAddr.fineYScroll;
-    unsigned short patternTableAddr = ((((unsigned short) ppuMem[tileAddr]) << 4) | startLine);
+    unsigned short patternTableAddr = 0x1000 + ((((unsigned short) ppuMem[tileAddr]) << 4) | startLine);
     ppu_obj.patternShiftRHi = ppuMem[patternTableAddr + 8];
     ppu_obj.patternShiftRLo = ppuMem[patternTableAddr];
     // attr table 0 base + attr table offset 
@@ -1814,8 +1842,8 @@ unsigned short inc5BitInt(unsigned short addr, int offset)
 void updatePixel(int x, int y, int rgb)
 {
     SDL_Rect rect;
-    rect.x = x;
-    rect.y = y;
-    rect.w = rect.h = 1;
+    rect.x = x * upscale;
+    rect.y = y * upscale;
+    rect.w = rect.h = upscale;
     SDL_FillRect(screenSurface, &rect, rgb);
 }
