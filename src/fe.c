@@ -278,6 +278,8 @@ unsigned char flags;
 unsigned long long instructionCount = 0;
 unsigned short cpuCyclesEmulated = 0;
 unsigned char overviewAfterInstruction = 0;
+unsigned char emulationPaused = 0;
+unsigned char ctrlHeld = 0;
 
 unsigned char upscale = 3;
 
@@ -407,8 +409,19 @@ int WinMain(int argc, char* argv[])
                     }
                     break;
                 }
+                case SDLK_p: // pause/unpause emulation
+                {
+                    emulationPaused = !emulationPaused;
+                    if (emulationPaused)
+                        printf("Emulation paused\n");
+                    else
+                        printf("Emulation unpaused\n");
+                    break;
+                }
             }
         }
+        if (emulationPaused)
+            continue;
         for (int s = -1; s < SCANLINES - 1; s++)
         {
             uint64_t time = timestamp();
@@ -432,6 +445,7 @@ int WinMain(int argc, char* argv[])
                 clearBit(cpuMem + PPUSTATUS, VBLANK_BIT); // exit VBlank
                 goto completion;
             }
+            // cycles 1-256
             for (int t = 0; t < 0x20; t++)
             {
                 for (int p = 0; p < 8; p++)
@@ -450,6 +464,8 @@ int WinMain(int argc, char* argv[])
             }
             if ((++ppu_obj.currentVRamAddr.fineYScroll) == 0)
                 ppu_obj.currentVRamAddr.coarseYScroll++;
+            // cycles 257-320
+
 completion:
             //uint64_t took = timestamp() - time;
             //printf("Completed emulation for scanline %i in %li us! (%f%% of time used, %lli instructions executed total)\n", s, took, took / 0.64, instructionCount);
@@ -1700,6 +1716,12 @@ void m6502store(unsigned char* r, unsigned short mem, int sz)
             ppu_obj.currentVRamAddr.exactAddr += 0x20;
         else
             ppu_obj.currentVRamAddr.exactAddr++;
+    }
+    if (mem == OAMDMA) // pretend like i'm not doing this way faster than necessary
+    {
+        unsigned short basePageAddr = ((unsigned short) *r) << 8;
+        for (int i = 0; i < 256; i++)
+            ppu_obj.pOAM[i] = cpuMem[basePageAddr + i];
     }
     pc += sz;
 }
