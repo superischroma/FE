@@ -364,7 +364,7 @@ int WinMain(int argc, char* argv[])
     cpuMem[PPUADDR] = 0;
     cpuMem[PPUDATA] = 0;
 
-    FILE* file = fopen("./dk.nes", "r");
+    FILE* file = fopen("dk.nes", "rb");
     if (file == NULL)
     {
         feInfo("Could not find testing ROM");
