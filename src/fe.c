@@ -52,6 +52,29 @@
 #define PPUDATA 0x2007
 #define OAMDMA 0x4014
 
+// Controller Register
+#define CONTROLLER_1 0x4016
+#define CONTROLLER_2 0x4017
+
+// Controller Bindings
+#define C1_A 0
+#define C1_B 1
+#define C1_SELECT 2
+#define C1_START 3
+#define C1_UP 4
+#define C1_DOWN 5
+#define C1_LEFT 6
+#define C1_RIGHT 7
+
+#define C2_A 8
+#define C2_B 9
+#define C2_SELECT 10
+#define C2_START 11
+#define C2_UP 12
+#define C2_DOWN 13
+#define C2_LEFT 14
+#define C2_RIGHT 15
+
 // Vectors
 #define NMI_VECTOR 0xFFFA
 #define RESET_VECTOR 0xFFFC
@@ -59,6 +82,8 @@
 
 // PPUCTRL bits
 #define NMI_BIT 7
+#define BG_PATTERN_TABLE_BIT 4
+#define SPRITE_PATTERN_TABLE_BIT 3
 #define VRAM_INC_BIT 2
 
 // PPUSTATUS bits
@@ -270,18 +295,23 @@ const unsigned int palette_to_rgb_table[] = {
 const char ines_constant[] = "NES\x1A";
 
 unsigned char* cpuMem, * ppuMem;
-ppu_t ppu_obj = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0, 0, 0, 0, 0, 0 };
+ppu_t ppu = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0, 0, 0, 0, 0, 0 };
 unsigned short pc = 0x0000;
 unsigned char regA, regX, regY, regS;
 unsigned char flags;
+
+unsigned char readNC1 = 0;
+unsigned char readNC2 = 0;
 
 unsigned long long instructionCount = 0;
 unsigned short cpuCyclesEmulated = 0;
 unsigned char overviewAfterInstruction = 0;
 unsigned char emulationPaused = 0;
-unsigned char ctrlHeld = 0;
+unsigned short buttons = 0;
 
 unsigned char upscale = 3;
+
+Sint32 controllerBindings[16];
 
 SDL_Window* window = NULL;
 SDL_Surface* screenSurface = NULL;
@@ -366,6 +396,16 @@ int WinMain(int argc, char* argv[])
     cpuMem[PPUADDR] = 0;
     cpuMem[PPUDATA] = 0;
 
+    // Initialize (temporary) controller bindings
+    controllerBindings[C1_A] = SDLK_z;
+    controllerBindings[C1_B] = SDLK_x;
+    controllerBindings[C1_SELECT] = SDLK_RSHIFT;
+    controllerBindings[C1_START] = SDLK_KP_ENTER;
+    controllerBindings[C1_UP] = SDLK_UP;
+    controllerBindings[C1_DOWN] = SDLK_DOWN;
+    controllerBindings[C1_LEFT] = SDLK_LEFT;
+    controllerBindings[C1_RIGHT] = SDLK_RIGHT;
+
     FILE* file = fopen("dk.nes", "rb");
     if (file == NULL)
     {
@@ -395,6 +435,11 @@ int WinMain(int argc, char* argv[])
     {
         if (e.type == SDL_KEYDOWN)
         {
+            for (int i = 0; i < 16; i++)
+            {
+                if (e.key.keysym.sym == controllerBindings[i])
+                    buttons |= (1 << i);
+            }
             switch (e.key.keysym.sym)
             {
                 case SDLK_x: // print out nametable 0
@@ -409,6 +454,33 @@ int WinMain(int argc, char* argv[])
                     }
                     break;
                 }
+                case SDLK_z: // print out OAM area
+                {
+                    printf("OAM DMA:\n");
+                    for (unsigned short addr = 0x200; addr < 0x300; addr++)
+                    {
+                        if ((addr & 0x0F) == 0x00)
+                            printf("0x%04X | ", addr);
+                        printf("%02X ", cpuMem[addr]);
+                        if ((addr & 0x0F) == 0x0F)
+                            printf("\n");
+                    }
+                    printf("PPU Primary OAM:\n");
+                    for (unsigned short addr = 0x00; addr < 0x100; addr++)
+                    {
+                        printf("%02X ", ppu.pOAM[addr]);
+                        if ((addr & 0x0F) == 0x0F)
+                            printf("\n");
+                    }
+                    printf("PPU Secondary OAM:\n");
+                    for (unsigned short addr = 0x00; addr < 0x10; addr++)
+                    {
+                        printf("%02X ", ppu.sOAM[addr]);
+                        if ((addr & 0x0F) == 0x0F)
+                            printf("\n");
+                    }
+                    break;
+                }
                 case SDLK_p: // pause/unpause emulation
                 {
                     emulationPaused = !emulationPaused;
@@ -418,6 +490,14 @@ int WinMain(int argc, char* argv[])
                         printf("Emulation unpaused\n");
                     break;
                 }
+            }
+        }
+        if (e.type == SDL_KEYUP)
+        {
+            for (int i = 0; i < 16; i++)
+            {
+                if (e.key.keysym.sym == controllerBindings[i])
+                    buttons &= ~(1 << i);
             }
         }
         if (emulationPaused)
@@ -445,26 +525,64 @@ int WinMain(int argc, char* argv[])
                 clearBit(cpuMem + PPUSTATUS, VBLANK_BIT); // exit VBlank
                 goto completion;
             }
-            // cycles 1-256
+            // cycles 1-64 - secondary OAM clear
+            memset(ppu.sOAM, 0xFF, 32);
+            // cycles 65-256 - sprite register load
+            for (int i = 0, n = 0, y = (ppu.currentVRamAddr.coarseYScroll * 8) + ppu.currentVRamAddr.fineYScroll; i < 256; i += 4)
+            {
+                if (n >= 32) // 8 sprites found
+                    break;
+                unsigned char spriteY = ppu.pOAM[i];
+                // if current sprite is not on this scanline, continue
+                if (y < spriteY || y >= spriteY + 8)
+                    continue;
+                for (int j = 0; j < 4; j++) // copy sprite data into secondary OAM
+                    ppu.sOAM[n + j] = ppu.pOAM[i + j];
+                int startLine = y - spriteY;    
+                unsigned short patternTableAddr = (isBitSet(cpuMem[PPUCTRL], SPRITE_PATTERN_TABLE_BIT) ? 0x1000 : 0x0) + ((((unsigned short) ppu.pOAM[i + 1]) << 4) | startLine);
+                ppu.spriteShiftRegs[n / 4][0] = ppuMem[patternTableAddr + 8];
+                ppu.spriteShiftRegs[n / 4][1] = ppuMem[patternTableAddr];
+                ppu.spriteLatches[n / 4] = ppu.pOAM[i + 2];
+                ppu.spriteCounters[n / 4] = ppu.pOAM[i + 3];
+                n += 4;
+            }
+            // cycles 1-256 - BG rendering
+            unsigned char activeSprites = 0;
             for (int t = 0; t < 0x20; t++)
             {
                 for (int p = 0; p < 8; p++)
                 {
                     // load pixels for the current shift registers
-                    int paletteIndex = ((ppu_obj.paletteShiftRHi & 1) << 1) | (ppu_obj.paletteShiftRLo & 1);
-                    int paletteColorIndex = ((ppu_obj.patternShiftRHi & (1 << 7)) >> 6) | ((ppu_obj.patternShiftRLo & (1 << 7)) >> 7);
-                    updatePixel((t * 8) + p, s, palette_to_rgb_table[ppuMem[0x3F00 + (4 * paletteIndex) + paletteColorIndex]]);
-                    ppu_obj.paletteShiftRHi >>= 1;
-                    ppu_obj.paletteShiftRLo >>= 1;
-                    ppu_obj.patternShiftRHi <<= 1;
-                    ppu_obj.patternShiftRLo <<= 1;
+                    int paletteIndex = ((ppu.paletteShiftRHi & 1) << 1) | (ppu.paletteShiftRLo & 1);
+                    int paletteColorIndex = ((ppu.patternShiftRHi & (1 << 7)) >> 6) | ((ppu.patternShiftRLo & (1 << 7)) >> 7);
+                    int rgb = palette_to_rgb_table[ppuMem[0x3F00 + (4 * paletteIndex) + paletteColorIndex]];
+                    for (int sn = 0; sn < 8; sn++)
+                    {
+                        if (activeSprites & (1 << sn))
+                        {
+                            int spritePaletteIndex = ppu.spriteLatches[sn] & 0b11;
+                            int spritePaletteColorIndex = ((ppu.spriteShiftRegs[sn][0] & (1 << 7)) >> 6) | ((ppu.spriteShiftRegs[sn][1] & (1 << 7)) >> 7);
+                            if (spritePaletteColorIndex != 0)
+                                rgb = palette_to_rgb_table[ppuMem[0x3F10 + (4 * spritePaletteIndex) + spritePaletteColorIndex]];
+                            ppu.spriteShiftRegs[sn][0] <<= 1;
+                            ppu.spriteShiftRegs[sn][1] <<= 1;
+                            if (ppu.spriteCounters[sn] == 0xF9)
+                                activeSprites &= ~(1 << sn);
+                        }
+                        if (--ppu.spriteCounters[sn] == 0)
+                            activeSprites |= (1 << sn);
+                    }
+                    updatePixel((t * 8) + p, s, rgb);
+                    ppu.paletteShiftRHi >>= 1;
+                    ppu.paletteShiftRLo >>= 1;
+                    ppu.patternShiftRHi <<= 1;
+                    ppu.patternShiftRLo <<= 1;
                 }
-                ppu_obj.currentVRamAddr.coarseXScroll++;
+                ppu.currentVRamAddr.coarseXScroll++;
                 loadTwoTiles();
             }
-            if ((++ppu_obj.currentVRamAddr.fineYScroll) == 0)
-                ppu_obj.currentVRamAddr.coarseYScroll++;
-            // cycles 257-320
+            if ((++ppu.currentVRamAddr.fineYScroll) == 0)
+                ppu.currentVRamAddr.coarseYScroll++;
 
 completion:
             //uint64_t took = timestamp() - time;
@@ -1678,50 +1796,60 @@ void m6502store(unsigned char* r, unsigned short mem, int sz)
     cpuMem[mem] = *r;
     if (mem == PPUSCROLL)
     {
-        if (ppu_obj.writeToggle) // changing y scroll
+        if (ppu.writeToggle) // changing y scroll
         {
-            ppu_obj.currentVRamAddr.coarseYScroll = *r / 8;
-            ppu_obj.currentVRamAddr.fineYScroll = *r % 8;
-            ppu_obj.writeToggle = 0;
+            ppu.currentVRamAddr.coarseYScroll = *r / 8;
+            ppu.currentVRamAddr.fineYScroll = *r % 8;
+            ppu.writeToggle = 0;
         }
         else
         {
-            ppu_obj.currentVRamAddr.coarseXScroll = *r / 8;
-            ppu_obj.fineXScroll = *r % 8;
-            ppu_obj.writeToggle = 1;
+            ppu.currentVRamAddr.coarseXScroll = *r / 8;
+            ppu.fineXScroll = *r % 8;
+            ppu.writeToggle = 1;
         }
     }
     if (mem == PPUADDR) // some goofy bit mirroring because i was lazy earlier
     {
-        if (ppu_obj.writeToggle) // write latch set, low byte being updated
+        if (ppu.writeToggle) // write latch set, low byte being updated
         {
-            ppu_obj.currentVRamAddr.exactAddr = (ppu_obj.currentVRamAddr.exactAddr & 0x3F00) | *r;
+            ppu.currentVRamAddr.exactAddr = (ppu.currentVRamAddr.exactAddr & 0x3F00) | *r;
             //ppu_obj.currentVRamAddr.fineYScroll = ppu_obj.currentVRamAddr.exactAddr >> 12;
             //ppu_obj.currentVRamAddr.nametableSelect = (ppu_obj.currentVRamAddr.exactAddr >> 10) & 0b11;
             //ppu_obj.currentVRamAddr.coarseYScroll = (ppu_obj.currentVRamAddr.coarseYScroll & 0b111) | (((ppu_obj.currentVRamAddr.exactAddr >> 8) & 0b11) << 3);
-            ppu_obj.writeToggle = 0;
+            ppu.writeToggle = 0;
         }
         else
         {
-            ppu_obj.currentVRamAddr.exactAddr = (ppu_obj.currentVRamAddr.exactAddr & 0xFF) | (((unsigned short) *r) << 8);
+            ppu.currentVRamAddr.exactAddr = (ppu.currentVRamAddr.exactAddr & 0xFF) | (((unsigned short) *r) << 8);
             //pu_obj.currentVRamAddr.coarseYScroll = (ppu_obj.currentVRamAddr.coarseYScroll & 0b11000) | ((ppu_obj.currentVRamAddr.exactAddr >> 5) & 0b111);
             //ppu_obj.currentVRamAddr.coarseXScroll = ppu_obj.currentVRamAddr.exactAddr & 0b11111;
-            ppu_obj.writeToggle = 1;
+            ppu.writeToggle = 1;
         }
     }
     if (mem == PPUDATA)
     {
-        ppuMem[ppu_obj.currentVRamAddr.exactAddr] = *r;
+        ppuMem[ppu.currentVRamAddr.exactAddr] = *r;
         if(isBitSet(cpuMem[PPUCTRL], VRAM_INC_BIT))
-            ppu_obj.currentVRamAddr.exactAddr += 0x20;
+            ppu.currentVRamAddr.exactAddr += 0x20;
         else
-            ppu_obj.currentVRamAddr.exactAddr++;
+            ppu.currentVRamAddr.exactAddr++;
     }
     if (mem == OAMDMA) // pretend like i'm not doing this way faster than necessary
     {
         unsigned short basePageAddr = ((unsigned short) *r) << 8;
         for (int i = 0; i < 256; i++)
-            ppu_obj.pOAM[i] = cpuMem[basePageAddr + i];
+            ppu.pOAM[i] = cpuMem[basePageAddr + i];
+    }
+    if (mem == OAMDATA)
+        ppu.pOAM[cpuMem[OAMADDR]] = *r;
+    if (mem == CONTROLLER_1)
+    {
+        if (*r == 0)
+        {
+            readNC1 = 0;
+            readNC2 = 0;
+        }
     }
     pc += sz;
 }
@@ -1733,7 +1861,15 @@ void m6502load_m(unsigned char* r, unsigned short mem, int sz)
     *r = cpuMem[mem];
     updateSignFlags(*r);
     if (mem == PPUSTATUS)
-        ppu_obj.writeToggle = 0; // reset address latch
+        ppu.writeToggle = 0; // reset address latch
+    if (mem == CONTROLLER_1)
+    {
+        if (readNC1 >= 8)
+            *r = (unsigned char) 1;
+        else
+            *r = (unsigned char) ((buttons & (1 << readNC1)) != 0);
+        readNC1++;
+    }
     pc += sz;
 }
 
@@ -1836,21 +1972,21 @@ uint64_t timestamp()
 void loadTwoTiles()
 {
     // nametable 0 base + nametable offset + coarse y offset + coarse x offset
-    unsigned short nametableIndex = (0x20 * ppu_obj.currentVRamAddr.coarseYScroll) + (ppu_obj.currentVRamAddr.coarseXScroll);
-    unsigned short tileAddr = 0x2000 + (ppu_obj.currentVRamAddr.nametableSelect * 0x400) + nametableIndex;
+    unsigned short nametableIndex = (0x20 * ppu.currentVRamAddr.coarseYScroll) + (ppu.currentVRamAddr.coarseXScroll);
+    unsigned short tileAddr = 0x2000 + (ppu.currentVRamAddr.nametableSelect * 0x400) + nametableIndex;
     // fine y offset
-    int startLine = ppu_obj.currentVRamAddr.fineYScroll;
-    unsigned short patternTableAddr = 0x1000 + ((((unsigned short) ppuMem[tileAddr]) << 4) | startLine);
-    ppu_obj.patternShiftRHi = ppuMem[patternTableAddr + 8];
-    ppu_obj.patternShiftRLo = ppuMem[patternTableAddr];
+    int startLine = ppu.currentVRamAddr.fineYScroll;
+    unsigned short patternTableAddr = (isBitSet(cpuMem[PPUCTRL], BG_PATTERN_TABLE_BIT) ? 0x1000 : 0x0) + ((((unsigned short) ppuMem[tileAddr]) << 4) | startLine);
+    ppu.patternShiftRHi = ppuMem[patternTableAddr + 8];
+    ppu.patternShiftRLo = ppuMem[patternTableAddr];
     // attr table 0 base + attr table offset 
-    unsigned short attrAddr = 0x23C0 + (ppu_obj.currentVRamAddr.nametableSelect * 0x400) + ((nametableIndex / 0x80) * 8) + ((nametableIndex / 4) % 8);
-    ppu_obj.paletteShiftRHi = ppu_obj.paletteShiftRLo = 0;
+    unsigned short attrAddr = 0x23C0 + (ppu.currentVRamAddr.nametableSelect * 0x400) + ((nametableIndex / 0x80) * 8) + ((nametableIndex / 4) % 8);
+    ppu.paletteShiftRHi = ppu.paletteShiftRLo = 0;
     unsigned char loAttrBitIndex = ((1 << (4 * ((nametableIndex / 0x40) % 2)))) << (2 * ((nametableIndex / 0x02) % 2));
     if (ppuMem[attrAddr] & (loAttrBitIndex << 1))
-        ppu_obj.paletteShiftRHi = ~ppu_obj.paletteShiftRHi;
+        ppu.paletteShiftRHi = ~ppu.paletteShiftRHi;
     if (ppuMem[attrAddr] & loAttrBitIndex)
-        ppu_obj.paletteShiftRLo = ~ppu_obj.paletteShiftRLo;
+        ppu.paletteShiftRLo = ~ppu.paletteShiftRLo;
 }
 
 unsigned short inc5BitInt(unsigned short addr, int offset)
